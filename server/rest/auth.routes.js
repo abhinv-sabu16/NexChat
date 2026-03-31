@@ -1,122 +1,131 @@
 /**
  * rest/auth.routes.js
  *
- * REST-only endpoints for authentication.
- * GraphQL handles NO auth — this is the single entry point for JWTs.
+ * REST-only authentication endpoints. No GraphQL — never.
+ *
+ * These handlers are intentionally thin: input arrives, userService is called,
+ * response is sent. All business logic and DB access lives in userService.
  */
 
-import { Router } from 'express';
-import rateLimit  from 'express-rate-limit';
-import User       from '../models/User.js';
-import {
-  signAccessToken,
-  signRefreshToken,
-} from '../middleware/auth.js';
+import { Router   } from 'express';
+import rateLimit    from 'express-rate-limit';
+import jwt          from 'jsonwebtoken';
+import { registerUser, loginUser, getUserById } from '../services/userService.js';
+import { signAccessToken, signRefreshToken }    from '../middleware/auth.js';
+import { asyncHandler }                         from '../middleware/errorHandler.js';
+import { validate, RegisterSchema, LoginSchema } from '../lib/validators.js';
+import { REFRESH_TOKEN_COOKIE, JWT }             from '../lib/constants.js';
+import { AuthenticationError }                   from '../lib/errors.js';
 
 export const authRouter = Router();
 
-// ─── Rate limiting (auth endpoints are high-value attack targets) ─────────────
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+// Auth endpoints are the highest-value brute-force targets
 
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 20,                   // 20 attempts per window per IP
+  windowMs:       15 * 60 * 1000, // 15 minutes
+  max:            20,
   standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
+  legacyHeaders:   false,
+  message:         { error: 'Too many attempts. Please try again later.' },
 });
 
 authRouter.use(authLimiter);
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function setRefreshCookie(res, token) {
+  res.cookie(
+    REFRESH_TOKEN_COOKIE.NAME,
+    token,
+    REFRESH_TOKEN_COOKIE.OPTIONS
+  );
+}
+
 // ─── POST /api/auth/register ─────────────────────────────────────────────────
 
-authRouter.post('/register', async (req, res) => {
-  try {
-    const { username, email, password, publicKey } = req.body;
+authRouter.post(
+  '/register',
+  asyncHandler(async (req, res) => {
+    // Zod validation at the boundary — throws ValidationError (→ 400) on failure
+    const input = validate(RegisterSchema, req.body);
 
-    // Basic input validation
-    if (!username || !email || !password) {
-      return res.status(400).json({ error: 'username, email, and password are required.' });
-    }
-    if (password.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters.' });
-    }
+    const user = await registerUser(input);
 
-    // Duplicate check
-    const exists = await User.findOne({ $or: [{ email }, { username }] }).lean();
-    if (exists) {
-      return res.status(409).json({ error: 'Username or email already in use.' });
-    }
-
-    // Hash password and persist
-    const passwordHash = await User.hashPassword(password);
-    const user = await User.create({
-      username,
-      email,
-      passwordHash,
-      publicKey: publicKey ?? null, // ECDH public key uploaded at registration
-    });
-
-    const accessToken  = signAccessToken(user._id);
-    const refreshToken = signRefreshToken(user._id);
-
-    // Refresh token in HTTP-only cookie — never exposed to JS
-    res.cookie('refreshToken', refreshToken, {
-      httpOnly: true,
-      secure:   process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge:   7 * 24 * 60 * 60 * 1000, // 7 days
-    });
+    setRefreshCookie(res, signRefreshToken(user._id));
 
     return res.status(201).json({
-      accessToken,
-      user: user.toSafeObject(),
+      accessToken: signAccessToken(user._id),
+      user:        user.toSafeObject(),
     });
-  } catch (err) {
-    console.error('[auth/register]', err);
-    return res.status(500).json({ error: 'Internal server error.' });
-  }
-});
+  })
+);
 
 // ─── POST /api/auth/login ─────────────────────────────────────────────────────
 
-authRouter.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
+authRouter.post(
+  '/login',
+  asyncHandler(async (req, res) => {
+    const input = validate(LoginSchema, req.body);
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'email and password are required.' });
-    }
+    const user = await loginUser(input);
 
-    const user = await User.findOne({ email });
-    if (!user) {
-      // Generic message — don't leak whether the email exists
-      return res.status(401).json({ error: 'Invalid credentials.' });
-    }
-
-    const valid = await user.verifyPassword(password);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid credentials.' });
-    }
-
-    // Update presence
-    await User.findByIdAndUpdate(user._id, { presence: 'online' });
-
-    const accessToken  = signAccessToken(user._id);
-    const refreshToken = signRefreshToken(user._id);
-
-    res.cookie('refreshToken', refreshToken, {
-      httpOnly: true,
-      secure:   process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge:   7 * 24 * 60 * 60 * 1000,
-    });
+    setRefreshCookie(res, signRefreshToken(user._id));
 
     return res.status(200).json({
-      accessToken,
-      user: user.toSafeObject(),
+      accessToken: signAccessToken(user._id),
+      user:        user.toSafeObject(),
     });
-  } catch (err) {
-    console.error('[auth/login]', err);
-    return res.status(500).json({ error: 'Internal server error.' });
-  }
+  })
+);
+
+// ─── POST /api/auth/refresh ───────────────────────────────────────────────────
+/**
+ * Exchanges a valid refresh token (HTTP-only cookie) for a new access token.
+ * Implements token rotation: old refresh token is replaced with a new one.
+ *
+ * This is the only way clients obtain a new access token after the 15-min
+ * access token expires — no credentials needed, just the cookie.
+ */
+authRouter.post(
+  '/refresh',
+  asyncHandler(async (req, res) => {
+    const token = req.cookies?.[REFRESH_TOKEN_COOKIE.NAME];
+
+    if (!token) {
+      throw new AuthenticationError('Refresh token is missing.');
+    }
+
+    let payload;
+    try {
+      payload = jwt.verify(token, process.env.JWT_REFRESH_SECRET, {
+        issuer: JWT.ISSUER,
+      });
+    } catch {
+      // Clear the invalid cookie so the client is forced to log in again
+      res.clearCookie(REFRESH_TOKEN_COOKIE.NAME, REFRESH_TOKEN_COOKIE.OPTIONS);
+      throw new AuthenticationError('Refresh token is invalid or expired.');
+    }
+
+    // Verify the user still exists (handles deleted/suspended accounts)
+    const user = await getUserById(payload.sub);
+
+    // Token rotation: issue a fresh refresh token on every use
+    setRefreshCookie(res, signRefreshToken(user._id));
+
+    return res.status(200).json({
+      accessToken: signAccessToken(user._id),
+    });
+  })
+);
+
+// ─── POST /api/auth/logout ────────────────────────────────────────────────────
+/**
+ * Clears the refresh token cookie.
+ * Access tokens are short-lived (15 min) and self-expire — no server-side
+ * revocation needed at this scale.
+ */
+authRouter.post('/logout', (_req, res) => {
+  res.clearCookie(REFRESH_TOKEN_COOKIE.NAME, REFRESH_TOKEN_COOKIE.OPTIONS);
+  return res.status(200).json({ message: 'Logged out.' });
 });

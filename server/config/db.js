@@ -9,24 +9,27 @@
  */
 
 import mongoose from 'mongoose';
+import { AppError } from '../lib/errors.js';
 
 const MONGOOSE_OPTIONS = {
-  // Let the driver pick the best server — avoids deprecated topology warnings
   serverSelectionTimeoutMS: 5_000,
+  // Automatically retry failed operations once (covers transient network blips)
+  retryWrites: true,
+  retryReads:  true,
 };
 
 export async function connectDB() {
   const uri = process.env.MONGODB_URI;
-  if (!uri) throw new Error('MONGODB_URI environment variable is not set.');
+  if (!uri) throw new AppError('MONGODB_URI environment variable is not set.', 500, 'CONFIG_ERROR');
 
   mongoose.connection.on('disconnected', () =>
-    console.warn('[db] MongoDB disconnected')
+    console.warn('[db] MongoDB disconnected — waiting for reconnect')
   );
   mongoose.connection.on('reconnected', () =>
     console.info('[db] MongoDB reconnected')
   );
   mongoose.connection.on('error', (err) =>
-    console.error('[db] MongoDB error:', err.message)
+    console.error('[db] MongoDB connection error:', err.message)
   );
 
   await mongoose.connect(uri, MONGOOSE_OPTIONS);

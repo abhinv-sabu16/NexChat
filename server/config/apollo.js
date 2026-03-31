@@ -49,7 +49,8 @@ export async function createApolloServer(httpServer) {
     introspection: !IS_PROD,
 
     // Format errors before sending to client — strip internal details in prod
-    formatError(formattedError, error) {
+    // eslint-disable-next-line no-unused-vars
+    formatError(formattedError, _error) {
       if (IS_PROD) {
         // Never leak stack traces or internal error messages to clients
         const safeMessage =

@@ -73,6 +73,13 @@ export function registerChatSocket(io) {
   // Uses the same getUserFromToken() as REST and GraphQL — zero duplication.
   io.use(socketAuthMiddleware);
 
+  // ── Server-level error handler ────────────────────────────────────────────
+  // Catches errors emitted on the io engine itself (e.g. transport failures).
+  // Individual socket errors are handled per-event via try/catch + ack.
+  io.engine.on('connection_error', (err) => {
+    console.error(`[socket] Engine connection error: ${err.code} — ${err.message}`);
+  });
+
   io.on('connection', async (socket) => {
     const { user } = socket;
     console.info(`[socket] + ${user.username} (${socket.id})`);
