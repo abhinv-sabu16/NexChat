@@ -21,42 +21,117 @@
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DB_NAME    = 'nexchat-keys';
-const DB_VERSION = 1;
+const DB_VERSION = 2;           // bumped from 1 → forces onupgradeneeded to re-run
 const KEY_STORE  = 'keypairs';
 const MY_KEY_ID  = 'self';
 
 // ─── IndexedDB helpers ────────────────────────────────────────────────────────
 
+/**
+ * Opens (or creates/upgrades) the key store.
+ *
+ * Fixes vs original:
+ *   - DB_VERSION bumped to 2 so onupgradeneeded fires on existing v1 databases
+ *     that are missing the object store (e.g. after storage was partially cleared).
+ *   - onupgradeneeded guards with objectStoreNames.contains() before creating,
+ *     so it's safe to call on both fresh installs and upgrades.
+ *   - onversionchange closes the connection when another tab upgrades the DB,
+ *     preventing the "blocked" state that causes the IDBDatabase transaction error.
+ *   - onerror and onblocked handlers added for clear diagnostics.
+ */
 function openKeyStore() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
 
     req.onupgradeneeded = (e) => {
-      e.target.result.createObjectStore(KEY_STORE);
+      const db = e.target.result;
+      // Guard: only create if missing — safe for both fresh install and upgrade
+      if (!db.objectStoreNames.contains(KEY_STORE)) {
+        db.createObjectStore(KEY_STORE);
+      }
     };
 
-    req.onsuccess = (e) => resolve(e.target.result);
-    req.onerror   = ()  => reject(new Error('Failed to open IndexedDB key store.'));
+    req.onsuccess = (e) => {
+      const db = e.target.result;
+
+      // If another tab opens a newer DB version, close this connection
+      // so the upgrade isn't blocked and the IDBDatabase error doesn't surface.
+      db.onversionchange = () => {
+        db.close();
+      };
+
+      resolve(db);
+    };
+
+    req.onerror = () =>
+      reject(new Error(`IndexedDB open failed: ${req.error?.message ?? 'unknown error'}`));
+
+    req.onblocked = () =>
+      reject(new Error(
+        'IndexedDB upgrade blocked by another tab. Close other tabs and reload.'
+      ));
+  });
+}
+
+/**
+ * Runs a transaction and returns a promise that resolves/rejects
+ * based on the transaction's own complete/error events — not just
+ * the individual request. This catches the "object store not found"
+ * error at the right level with a clear message.
+ */
+function runTransaction(db, storeNames, mode, fn) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(storeNames, mode);
+    } catch (err) {
+      // Catches "One of the specified object stores was not found"
+      return reject(new Error(
+        `DB transaction failed — the key store may be missing. ` +
+        `Try clearing site data and logging in again. (${err.message})`
+      ));
+    }
+
+    tx.onerror   = () => reject(tx.error);
+    tx.onabort   = () => reject(tx.error ?? new Error('Transaction aborted.'));
+
+    try {
+      const result = fn(tx);
+      tx.oncomplete = () => resolve(result);
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
 async function storePrivateKey(privateKey) {
   const db = await openKeyStore();
-  return new Promise((resolve, reject) => {
-    const tx  = db.transaction(KEY_STORE, 'readwrite');
-    const req = tx.objectStore(KEY_STORE).put(privateKey, MY_KEY_ID);
-    req.onsuccess = () => resolve();
-    req.onerror   = () => reject(new Error('Failed to store private key.'));
+  return runTransaction(db, KEY_STORE, 'readwrite', (tx) => {
+    tx.objectStore(KEY_STORE).put(privateKey, MY_KEY_ID);
+    // result resolved in oncomplete — the put request's onsuccess
+    // fires before the transaction commits, so we rely on oncomplete.
   });
 }
 
 async function loadPrivateKey() {
   const db = await openKeyStore();
   return new Promise((resolve, reject) => {
-    const tx  = db.transaction(KEY_STORE, 'readonly');
+    let tx;
+    try {
+      tx = db.transaction(KEY_STORE, 'readonly');
+    } catch (err) {
+      return reject(new Error(
+        `DB transaction failed — the key store may be missing. ` +
+        `Try clearing site data and logging in again. (${err.message})`
+      ));
+    }
+
     const req = tx.objectStore(KEY_STORE).get(MY_KEY_ID);
     req.onsuccess = (e) => resolve(e.target.result ?? null);
-    req.onerror   = () => reject(new Error('Failed to load private key.'));
+    req.onerror   = () => reject(new Error(
+      `Failed to load private key: ${req.error?.message ?? 'unknown error'}`
+    ));
+    tx.onerror    = () => reject(tx.error);
   });
 }
 
@@ -187,8 +262,8 @@ export async function decryptMessage(ciphertext, sharedKey) {
  * @param {CryptoKey} sharedKey  - ECDH shared key (encrypts the file key)
  *
  * @returns {Promise<{
- *   encryptedBlob:    Blob,   - Encrypted file bytes for S3 upload
- *   encryptedFileKey: string, - base64: file AES key encrypted with sharedKey
+ *   encryptedBlob:    Blob,
+ *   encryptedFileKey: string,
  *   originalName:     string,
  *   mimeType:         string,
  * }>}
@@ -202,8 +277,8 @@ export async function encryptFile(file, sharedKey) {
   );
 
   // 2. Encrypt file bytes with the file key
-  const fileIv      = crypto.getRandomValues(new Uint8Array(12));
-  const fileBuffer  = await file.arrayBuffer();
+  const fileIv        = crypto.getRandomValues(new Uint8Array(12));
+  const fileBuffer    = await file.arrayBuffer();
   const encryptedFile = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: fileIv },
     fileKey,
@@ -216,9 +291,9 @@ export async function encryptFile(file, sharedKey) {
   combined.set(new Uint8Array(encryptedFile), fileIv.length);
 
   // 3. Export and encrypt the file key with the ECDH shared key
-  const rawFileKey    = await crypto.subtle.exportKey('raw', fileKey);
-  const keyIv         = crypto.getRandomValues(new Uint8Array(12));
-  const encryptedKey  = await crypto.subtle.encrypt(
+  const rawFileKey   = await crypto.subtle.exportKey('raw', fileKey);
+  const keyIv        = crypto.getRandomValues(new Uint8Array(12));
+  const encryptedKey = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: keyIv },
     sharedKey,
     rawFileKey
@@ -247,8 +322,8 @@ export async function encryptFile(file, sharedKey) {
 export async function decryptFile(encryptedBuffer, encryptedFileKey, sharedKey, mimeType) {
   // 1. Decrypt the file key
   const [keyIvB64, encKeyB64] = encryptedFileKey.split(':');
-  const keyIv    = new Uint8Array(base64ToBuffer(keyIvB64));
-  const encKey   = base64ToBuffer(encKeyB64);
+  const keyIv      = new Uint8Array(base64ToBuffer(keyIvB64));
+  const encKey     = base64ToBuffer(encKeyB64);
   const rawFileKey = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: keyIv },
     sharedKey,
@@ -264,9 +339,8 @@ export async function decryptFile(encryptedBuffer, encryptedFileKey, sharedKey, 
   );
 
   // 2. Split IV and ciphertext from the downloaded buffer
-  const fileIv = new Uint8Array(encryptedBuffer, 0, 12);
-  const ct     = encryptedBuffer.slice(12);
-
+  const fileIv    = new Uint8Array(encryptedBuffer, 0, 12);
+  const ct        = encryptedBuffer.slice(12);
   const decrypted = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: fileIv },
     fileKey,
