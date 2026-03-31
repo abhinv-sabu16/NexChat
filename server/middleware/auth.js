@@ -1,82 +1,150 @@
-import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
-
-const { JWT_SECRET } = process.env;
-
 /**
- * Verifies a Bearer token and returns the user document.
- * Throws with a descriptive message on any failure.
+ * middleware/auth.js
  *
- * Used in two places:
- *   1. verifyToken(req, res, next)  → Express middleware for REST routes
- *   2. getUserFromToken(token)      → Apollo context builder for GraphQL
+ * JWT verification layer shared across all three transport layers:
+ *
+ *   REST      → verifyToken(req, res, next)   — Express middleware
+ *   GraphQL   → buildApolloContext({ req })   — Apollo context builder
+ *   Socket.io → socketAuthMiddleware(socket)  — Socket.io middleware
+ *
+ * All three call the same getUserFromToken() core. Zero duplication.
  */
 
-// ─── Shared token extractor ──────────────────────────────────────────────────
+import jwt  from 'jsonwebtoken';
+import User from '../models/User.js';
+import { AuthenticationError } from '../lib/errors.js';
+import { JWT } from '../lib/constants.js';
 
+// ─── Token extraction ─────────────────────────────────────────────────────────
+
+/**
+ * Pulls the raw token string from an "Authorization: Bearer <token>" header.
+ * Returns null if the header is absent or malformed.
+ */
 export function extractBearerToken(authHeader) {
-  if (!authHeader?.startsWith('Bearer ')) return null;
-  return authHeader.slice(7);
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim() || null;
+  }
+  return null;
 }
 
-// ─── Core verification (framework-agnostic) ───────────────────────────────────
+// ─── Core verification ────────────────────────────────────────────────────────
 
+/**
+ * Verifies a raw JWT string and returns the corresponding User document.
+ *
+ * Returns null (does NOT throw) so that:
+ *   - GraphQL resolvers can decide per-field whether auth is required
+ *   - REST middleware can produce a proper 401 response
+ *   - Socket middleware can reject the connection
+ *
+ * @param {string|null} token
+ * @returns {Promise<object|null>} Lean user document or null
+ */
 export async function getUserFromToken(token) {
   if (!token) return null;
 
   let payload;
   try {
-    payload = jwt.verify(token, JWT_SECRET);
+    payload = jwt.verify(token, process.env.JWT_SECRET, {
+      issuer: JWT.ISSUER,
+    });
   } catch {
-    return null; // expired or tampered — GraphQL resolvers check ctx.user
+    // Expired, malformed, or tampered — caller decides what to do
+    return null;
   }
 
   const user = await User.findById(payload.sub).lean();
   return user ?? null;
 }
 
-// ─── Express middleware ───────────────────────────────────────────────────────
+// ─── REST middleware ──────────────────────────────────────────────────────────
 
 /**
- * Protects REST routes.
- * Attaches req.user on success; responds 401 on failure.
+ * Express middleware for protected REST routes.
+ * Attaches req.user on success; sends 401 JSON on failure.
  */
 export async function verifyToken(req, res, next) {
-  const token = extractBearerToken(req.headers.authorization);
+  try {
+    const token = extractBearerToken(req.headers.authorization);
+    const user  = await getUserFromToken(token);
 
-  if (!token) {
-    return res.status(401).json({ error: 'Missing or malformed Authorization header.' });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid or expired token.' });
+    }
+
+    req.user = user;
+    next();
+  } catch (err) {
+    next(err); // pass unexpected errors to the central error handler
   }
-
-  const user = await getUserFromToken(token);
-
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid or expired token.' });
-  }
-
-  req.user = user;
-  next();
 }
 
-// ─── Token issuance helpers ───────────────────────────────────────────────────
+// ─── GraphQL context builder ──────────────────────────────────────────────────
 
 /**
- * Issues a short-lived access token (15 min).
+ * Apollo Server context function.
+ * Attaches ctx.user (or null for unauthenticated requests).
+ * Individual resolvers call requireAuth(ctx) for protected fields.
+ *
+ * @param {{ req: import('express').Request }} param0
+ * @returns {Promise<{ user: object|null }>}
  */
+export async function buildApolloContext({ req }) {
+  const token = extractBearerToken(req.headers.authorization);
+  const user  = await getUserFromToken(token);
+  return { user };
+}
+
+/**
+ * Guard used inside GraphQL resolvers.
+ * Throws AuthenticationError (which Apollo serialises correctly) if unauthenticated.
+ *
+ * Usage:
+ *   me: (_p, _a, ctx) => { requireAuth(ctx); return ... }
+ */
+export function requireAuth(ctx) {
+  if (!ctx.user) throw new AuthenticationError();
+}
+
+// ─── Socket.io middleware ─────────────────────────────────────────────────────
+
+/**
+ * Socket.io connection middleware.
+ * Token is expected in socket.handshake.auth.token.
+ * Rejects the connection with a descriptive error if invalid.
+ *
+ * Usage:
+ *   io.use(socketAuthMiddleware);
+ */
+export async function socketAuthMiddleware(socket, next) {
+  try {
+    const token = socket.handshake.auth?.token ?? null;
+    const user  = await getUserFromToken(token);
+
+    if (!user) {
+      return next(new AuthenticationError('Invalid or missing socket auth token.'));
+    }
+
+    socket.user = user;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Token issuance ───────────────────────────────────────────────────────────
+
 export function signAccessToken(userId) {
-  return jwt.sign({ sub: userId }, JWT_SECRET, {
-    expiresIn: '15m',
-    issuer: 'nexchat',
+  return jwt.sign({ sub: String(userId) }, process.env.JWT_SECRET, {
+    expiresIn: JWT.ACCESS_EXPIRY,
+    issuer:    JWT.ISSUER,
   });
 }
 
-/**
- * Issues a long-lived refresh token (7 days).
- * Should be stored in an HTTP-only cookie — handled in the auth route.
- */
 export function signRefreshToken(userId) {
-  return jwt.sign({ sub: userId }, process.env.JWT_REFRESH_SECRET, {
-    expiresIn: '7d',
-    issuer: 'nexchat',
+  return jwt.sign({ sub: String(userId) }, process.env.JWT_REFRESH_SECRET, {
+    expiresIn: JWT.REFRESH_EXPIRY,
+    issuer:    JWT.ISSUER,
   });
 }
