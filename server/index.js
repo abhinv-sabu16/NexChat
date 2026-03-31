@@ -1,205 +1,155 @@
-require('dotenv').config();
-process.on('uncaughtException', (err) => { console.error('CRITICAL: Uncaught Exception:', err); });
-process.on('unhandledRejection', (reason, promise) => { console.error('CRITICAL: Unhandled Rejection at:', promise, 'reason:', reason); });
-const express = require('express');
-const { createServer } = require('http');
-const { Server } = require('socket.io');
-const mongoose = require('mongoose');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const { verifyToken, authMiddleware } = require('./middleware/auth');
-const Message = require('./models/Message');
-const Room = require('./models/Room');
+/**
+ * server/index.js
+ *
+ * Application entry point.
+ *
+ * Bootstraps three layers in a single HTTP server:
+ *   1. Express  → REST (auth + file uploads)
+ *   2. Apollo   → GraphQL (data fetching)
+ *   3. Socket.io → Real-time messaging
+ *
+ * Strict separation:
+ *   - Auth    → REST only
+ *   - Uploads → REST only
+ *   - Data    → GraphQL only
+ *   - Events  → Socket.io only
+ */
+
+import 'dotenv/config';
+import http       from 'http';
+import express    from 'express';
+import cors       from 'cors';
+import helmet     from 'helmet';
+import rateLimit  from 'express-rate-limit';
+import mongoose   from 'mongoose';
+import cookieParser from 'cookie-parser';
+
+import { ApolloServer }          from '@apollo/server';
+import { expressMiddleware }     from '@apollo/server/express4';
+import { ApolloServerPluginDrainHttpServer } from '@apollo/server/plugin/drainHttpServer';
+import { makeExecutableSchema }  from '@graphql-tools/schema';
+import { Server as SocketIOServer } from 'socket.io';
+
+import { typeDefs }          from './graphql/schema.js';
+import { userResolvers }     from './graphql/resolvers/userResolver.js';
+import { roomResolvers }     from './graphql/resolvers/roomResolver.js';
+import { messageResolvers }  from './graphql/resolvers/messageResolver.js';
+
+import { authRouter }        from './rest/auth.routes.js';
+import { fileRouter }        from './rest/file.routes.js';
+
+import { registerChatSocket } from './sockets/chat.socket.js';
+import { getUserFromToken, extractBearerToken } from './middleware/auth.js';
+
+const PORT = process.env.PORT ?? 4000;
+
+// ─── 1. Express app ───────────────────────────────────────────────────────────
 
 const app = express();
-const httpServer = createServer(app);
 
-// ── Socket.io ──────────────────────────────────
-const io = new Server(httpServer, {
+app.use(helmet({
+  // Apollo Studio / GraphQL playground needs this relaxed in dev
+  contentSecurityPolicy: process.env.NODE_ENV === 'production',
+}));
+
+app.use(cors({
+  origin:      process.env.CLIENT_URL ?? 'http://localhost:3000',
+  credentials: true,                // allow cookies (refresh token)
+}));
+
+app.use(cookieParser());
+app.use(express.json({ limit: '1mb' }));
+
+// Global rate limit for all non-auth routes
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+
+// ─── 2. REST routes ───────────────────────────────────────────────────────────
+
+app.use('/api/auth',  authRouter);
+app.use('/api/files', fileRouter);
+
+// ─── 3. HTTP server (shared with Socket.io) ───────────────────────────────────
+
+const httpServer = http.createServer(app);
+
+// ─── 4. Socket.io ────────────────────────────────────────────────────────────
+
+const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:3000',
-    methods: ['GET', 'POST'],
+    origin:      process.env.CLIENT_URL ?? 'http://localhost:3000',
     credentials: true,
   },
-  pingTimeout: 60000,
-  pingInterval: 25000,
+  // Automatic reconnection with exponential backoff is handled client-side
 });
 
-// ── Express middleware ─────────────────────────
-app.use(helmet());
-app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
-app.use(express.json({ limit: '10mb' }));
-app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
+registerChatSocket(io);
 
-// ── REST routes ────────────────────────────────
-app.use('/api/auth',  require('./routes/auth'));
-app.use('/api/users', authMiddleware, require('./routes/users'));
-app.use('/api/rooms', authMiddleware, require('./routes/rooms'));
-app.use('/api/files', authMiddleware, require('./routes/files'));
+// ─── 5. Apollo Server (GraphQL) ───────────────────────────────────────────────
 
-// ── MongoDB + Change Streams ───────────────────
+// Merge all resolvers; later keys override earlier ones for same type
+const schema = makeExecutableSchema({
+  typeDefs,
+  resolvers: [userResolvers, roomResolvers, messageResolvers],
+});
+
+const apollo = new ApolloServer({
+  schema,
+  plugins: [
+    // Graceful shutdown: drain HTTP server before closing Apollo
+    ApolloServerPluginDrainHttpServer({ httpServer }),
+  ],
+  // Disable introspection and playground in production
+  introspection: process.env.NODE_ENV !== 'production',
+});
+
+await apollo.start();
+
+/**
+ * Apollo context builder.
+ * Runs on every GraphQL request.
+ * Extracts the JWT from Authorization header and attaches the user.
+ *
+ * Resolvers check ctx.user and throw if authentication is required.
+ */
+app.use(
+  '/graphql',
+  expressMiddleware(apollo, {
+    context: async ({ req }) => {
+      const token = extractBearerToken(req.headers.authorization);
+      const user  = await getUserFromToken(token);
+      return { user }; // ctx.user is null for unauthenticated requests
+    },
+  })
+);
+
+// ─── 6. MongoDB ───────────────────────────────────────────────────────────────
+
 async function connectDB() {
-  console.log('🔗 Connecting to MongoDB...');
-  await mongoose.connect(process.env.MONGODB_URI);
-  console.log('✅ MongoDB connected, setting up streams...');
-  setupChangeStreams();
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error('MONGODB_URI is not set in environment.');
+
+  await mongoose.connect(uri);
+  console.log(`[db] Connected to MongoDB`);
 }
 
-function setupChangeStreams() {
-  const stream = Message.watch(
-    [{ $match: { operationType: 'insert' } }],
-    { fullDocument: 'updateLookup' }
-  );
+// ─── 7. Boot ──────────────────────────────────────────────────────────────────
 
-  stream.on('change', (change) => {
-    const msg = change.fullDocument;
-    io.to(`room:${msg.roomId}`).emit('message:new', {
-      _id:              msg._id,
-      roomId:           msg.roomId,
-      sender:           msg.sender,
-      encryptedContent: msg.encryptedContent,
-      iv:               msg.iv,
-      type:             msg.type,
-      fileMetadata:     msg.fileMetadata,
-      createdAt:        msg.createdAt,
-      reactions:        {},
-    });
+async function start() {
+  await connectDB();
+
+  httpServer.listen(PORT, () => {
+    console.log(`[server] REST    → http://localhost:${PORT}/api`);
+    console.log(`[server] GraphQL → http://localhost:${PORT}/graphql`);
+    console.log(`[server] WS      → ws://localhost:${PORT}`);
   });
-
-  stream.on('error', () => setTimeout(setupChangeStreams, 5000));
 }
 
-// ── Socket.io auth middleware ──────────────────
-io.use(async (socket, next) => {
-  try {
-    const user = await verifyToken(socket.handshake.auth.token);
-    socket.userId   = user._id.toString();
-    socket.username = user.username;
-    next();
-  } catch {
-    next(new Error('Authentication failed'));
-  }
+start().catch((err) => {
+  console.error('[boot] Fatal error:', err);
+  process.exit(1);
 });
-
-// ── Socket.io events ───────────────────────────
-const onlineUsers = new Map();
-
-io.on('connection', (socket) => {
-  console.log(`🔌 ${socket.username} connected`);
-
-  if (!onlineUsers.has(socket.userId)) onlineUsers.set(socket.userId, new Set());
-  onlineUsers.get(socket.userId).add(socket.id);
-  io.emit('presence:update', { userId: socket.userId, status: 'online' });
-
-  socket.on('room:join', async ({ roomId }) => {
-    try {
-      let room;
-      if (mongoose.Types.ObjectId.isValid(roomId)) {
-        room = await Room.findById(roomId).select('members');
-      } else {
-        room = await Room.findOne({ slug: roomId }).select('members');
-      }
-
-      if (!room) return socket.emit('error', { message: 'Room not found' });
-      if (!room.members.includes(socket.userId))
-        return socket.emit('error', { message: 'Access denied' });
-
-      socket.join(`room:${roomId}`);
-      const history = await Message.find({ roomId: room._id })
-        .sort({ createdAt: -1 }).limit(50).lean();
-      socket.emit('room:history', history.reverse());
-    } catch (err) {
-      console.error('Room join error:', err);
-      socket.emit('error', { message: 'Failed to join room' });
-    }
-  });
-
-  socket.on('room:leave', ({ roomId }) => socket.leave(`room:${roomId}`));
-
-  socket.on('message:send', async (payload) => {
-    try {
-      const { roomId, encryptedContent, iv, type = 'text', fileMetadata, tempId } = payload;
-      let room;
-      if (mongoose.Types.ObjectId.isValid(roomId)) {
-        room = await Room.findById(roomId).select('members');
-      } else {
-        room = await Room.findOne({ slug: roomId }).select('members');
-      }
-
-      if (!room) return socket.emit('error', { message: 'Room not found' });
-      if (!room.members.includes(socket.userId))
-        return socket.emit('error', { message: 'Access denied' });
-
-      const message = await Message.create({
-        roomId: room._id, sender: { _id: socket.userId, username: socket.username },
-        encryptedContent, iv, type, fileMetadata, status: 'sent',
-      });
-      await Room.findByIdAndUpdate(room._id, { lastActivity: new Date() });
-      socket.emit('message:ack', { tempId, messageId: message._id });
-    } catch (err) {
-      console.error('Message send error:', err);
-      socket.emit('error', { message: 'Failed to send message' });
-    }
-  });
-
-  socket.on('typing:start', ({ roomId }) => {
-    try {
-      socket.to(`room:${roomId}`).emit('typing:update',
-        { userId: socket.userId, username: socket.username, isTyping: true });
-    } catch (err) { console.error('Typing start error:', err); }
-  });
-
-  socket.on('typing:stop', ({ roomId }) => {
-    try {
-      socket.to(`room:${roomId}`).emit('typing:update',
-        { userId: socket.userId, username: socket.username, isTyping: false });
-    } catch (err) { console.error('Typing stop error:', err); }
-  });
-
-  socket.on('reaction:add', async ({ messageId, emoji }) => {
-    try {
-      const msg = await Message.findByIdAndUpdate(
-        messageId,
-        { $addToSet: { [`reactions.${emoji}`]: socket.userId } },
-        { new: true }
-      ).select('roomId reactions');
-      if (msg) {
-        io.to(`room:${msg.roomId}`).emit('reaction:update',
-          { messageId, reactions: msg.reactions });
-      }
-    } catch (err) {
-      console.error('Reaction error:', err);
-    }
-  });
-
-  socket.on('message:read', async ({ roomId, lastMessageId }) => {
-    try {
-      await Message.updateMany(
-        { roomId, _id: { $lte: lastMessageId }, 'readBy.userId': { $ne: socket.userId } },
-        { $addToSet: { readBy: { userId: socket.userId, readAt: new Date() } } }
-      );
-      socket.to(`room:${roomId}`).emit('receipts:update',
-        { userId: socket.userId, roomId, lastReadMessageId: lastMessageId });
-    } catch (err) {
-      console.error('Read receipt error:', err);
-    }
-  });
-
-  socket.on('disconnect', () => {
-    const sockets = onlineUsers.get(socket.userId);
-    sockets?.delete(socket.id);
-    if (!sockets?.size) {
-      onlineUsers.delete(socket.userId);
-      io.emit('presence:update', { userId: socket.userId, status: 'offline' });
-    }
-  });
-});
-
-// ── Start ──────────────────────────────────────
-const PORT = process.env.PORT || 4000;
-connectDB().then(() =>
-  httpServer.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`))
-).catch((err) => { console.error(err); process.exit(1); });
-
-module.exports = { app, io };

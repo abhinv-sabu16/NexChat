@@ -1,50 +1,46 @@
-const mongoose = require('mongoose');
+import mongoose from 'mongoose';
 
-const MessageSchema = new mongoose.Schema({
-  roomId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Room',
-    required: true,
-    index: true,
+const messageSchema = new mongoose.Schema(
+  {
+    /**
+     * Encrypted content (AES-256-GCM ciphertext, base64-encoded).
+     * The server stores and relays this — it cannot decrypt it.
+     * Format: "<iv_base64>:<ciphertext_base64>"
+     */
+    content: {
+      type: String,
+      required: true,
+    },
+    sender: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+    room: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Room',
+      required: true,
+    },
+    /**
+     * Optional: if this message carries an encrypted file attachment,
+     * the File document id is stored here.
+     */
+    file: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'File',
+      default: null,
+    },
+    readBy: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
+    ],
   },
-  sender: {
-    _id:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    username: { type: String, required: true },
-    avatar:   String,
-  },
+  { timestamps: true }
+);
 
-  // ── Encrypted payload — server never sees plaintext ──
-  encryptedContent: { type: String, required: true }, // AES-256-GCM ciphertext (Base64)
-  iv:               { type: String, required: true }, // 96-bit IV (Base64)
-  // GCM auth tag is embedded in the ciphertext by WebCrypto
+// Index for efficient paginated room history queries
+messageSchema.index({ room: 1, createdAt: -1 });
 
-  type:   { type: String, enum: ['text', 'file', 'image', 'system'], default: 'text' },
-  status: { type: String, enum: ['sending', 'sent', 'delivered', 'read'], default: 'sent' },
-
-  // File metadata — non-sensitive, stored plaintext for UI previews
-  fileMetadata: {
-    fileId:           String,
-    name:             String,
-    size:             Number,
-    mimeType:         String,
-    url:              String,    // CDN URL to the encrypted blob
-    encryptedFileKey: String,    // AES file key encrypted with ECDH shared key
-    fileKeyIv:        String,
-  },
-
-  // Reactions: { "👍": ["userId1", "userId2"], "🚀": ["userId3"] }
-  reactions: { type: Map, of: [String], default: {} },
-
-  readBy: [{
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    readAt: { type: Date, default: Date.now },
-  }],
-
-  editedAt:  Date,
-  deletedAt: Date, // soft delete
-}, { timestamps: true });
-
-MessageSchema.index({ roomId: 1, createdAt: -1 });
-MessageSchema.index({ 'sender._id': 1, createdAt: -1 });
-
-module.exports = mongoose.model('Message', MessageSchema);
+export default mongoose.model('Message', messageSchema);
