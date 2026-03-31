@@ -1,226 +1,267 @@
 /**
  * sockets/chat.socket.js
  *
- * All real-time features live here. GraphQL is NOT used for any of this.
- * Business logic (DB writes) is delegated to messageService.
+ * All real-time features. Pure event orchestration — no DB or model imports.
+ *
+ * Auth:        socketAuthMiddleware      — middleware/auth (shared with REST + GQL)
+ * Membership:  assertMembership          — services/roomService
+ * Messages:    createMessage,
+ *              markRoomAsRead            — services/messageService
+ * Presence:    setPresence,
+ *              isLastSocketForUser       — services/userService
+ * Validation:  validate + schemas        — lib/validators
+ *
+ * Security model:
+ *   - Every connection is authenticated at the handshake (socketAuthMiddleware)
+ *   - Every room action verifies membership via assertMembership BEFORE socket.join()
+ *   - All payloads are validated with Zod before reaching services
+ *   - Errors are caught and returned via ack callbacks — never crash the server
  */
 
-import jwt from 'jsonwebtoken';
-import User    from '../models/User.js';
-import Room    from '../models/Room.js';
-import {
-  createMessage,
-  markRoomAsRead,
-} from '../services/messageService.js';
+import { socketAuthMiddleware }          from '../middleware/auth.js';
+import { assertMembership }              from '../services/roomService.js';
+import { createMessage, markRoomAsRead } from '../services/messageService.js';
+import { setPresence, isLastSocketForUser } from '../services/userService.js';
+import { validate, SendMessageSchema, JoinRoomSchema } from '../lib/validators.js';
+import { TYPING_TIMEOUT_MS }             from '../lib/constants.js';
+import { AppError }                      from '../lib/errors.js';
 
-// ─── Typing debounce map (roomId:userId → timeout) ────────────────────────────
+// ─── Typing debounce registry ─────────────────────────────────────────────────
+// Key: `${roomId}:${userId}` → NodeJS.Timeout
+// Scoped to module — persists across connections, cleared on disconnect.
+
 const typingTimers = new Map();
-const TYPING_TIMEOUT_MS = 3000;
 
-// ─── Socket authentication ────────────────────────────────────────────────────
+// ─── Error serializer ─────────────────────────────────────────────────────────
 
 /**
- * Middleware: validates JWT passed in socket.handshake.auth.token.
- * Rejects the connection immediately if the token is missing or invalid.
+ * Serialises any error into a safe ack payload.
+ * AppError subclasses expose their message; unknown errors return a generic message.
  */
-async function socketAuthMiddleware(socket, next) {
-  try {
-    const token = socket.handshake.auth?.token;
-    if (!token) return next(new Error('Missing auth token.'));
+function serializeError(err) {
+  if (err instanceof AppError) {
+    return { ok: false, error: err.message, code: err.code };
+  }
+  console.error('[socket] Unexpected error:', err);
+  return { ok: false, error: 'An unexpected error occurred.', code: 'INTERNAL_ERROR' };
+}
 
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    const user    = await User.findById(payload.sub).lean();
+// ─── Typing helpers ───────────────────────────────────────────────────────────
 
-    if (!user) return next(new Error('User not found.'));
+function emitTypingUpdate(socket, roomId, isTyping) {
+  socket.to(roomId).emit('typing:update', {
+    userId:   socket.user._id,
+    username: socket.user.username,
+    roomId,
+    isTyping,
+  });
+}
 
-    // Attach user to socket for use in all event handlers
-    socket.user = user;
-    next();
-  } catch {
-    next(new Error('Invalid or expired token.'));
+function clearTypingTimer(key) {
+  const timer = typingTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    typingTimers.delete(key);
   }
 }
 
-// ─── Room membership guard ────────────────────────────────────────────────────
-
-async function assertRoomMember(roomId, userId) {
-  const room = await Room.findById(roomId).lean();
-  if (!room) throw new Error(`Room ${roomId} not found.`);
-
-  const isMember = room.members.some((m) => m.toString() === userId.toString());
-  if (!isMember) throw new Error('You are not a member of this room.');
-
-  return room;
-}
-
-// ─── Main handler ─────────────────────────────────────────────────────────────
+// ─── Main registration ────────────────────────────────────────────────────────
 
 export function registerChatSocket(io) {
-  // Apply auth middleware to every incoming socket connection
+  // ── Authentication middleware ─────────────────────────────────────────────
+  // Every connection must carry a valid JWT in handshake.auth.token.
+  // Uses the same getUserFromToken() as REST and GraphQL — zero duplication.
   io.use(socketAuthMiddleware);
 
   io.on('connection', async (socket) => {
     const { user } = socket;
-    console.log(`[socket] connected: ${user.username} (${socket.id})`);
+    console.info(`[socket] + ${user.username} (${socket.id})`);
 
-    // Mark user online
-    await User.findByIdAndUpdate(user._id, { presence: 'online' });
+    // Mark user online; broadcast to all other connected clients
+    await setPresence(user._id, 'online');
     socket.broadcast.emit('presence:update', { userId: user._id, presence: 'online' });
 
-    // ── join:room ─────────────────────────────────────────────────────────────
-    // Client calls this after loading a room via GraphQL.
-
-    socket.on('join:room', async (roomId, ack) => {
+    // ── join:room ───────────────────────────────────────────────────────────
+    /**
+     * Client must call this after loading a room via GraphQL.
+     *
+     * Security: assertMembership runs BEFORE socket.join().
+     * A user who is not a room member never enters the Socket.io room,
+     * meaning they can never receive any message:new or typing:update events.
+     *
+     * Payload: { roomId: string }
+     * Ack:     { ok: true } | { ok: false, error: string, code: string }
+     */
+    socket.on('join:room', async (payload, ack) => {
       try {
-        await assertRoomMember(roomId, user._id);
+        const { roomId } = validate(JoinRoomSchema, payload ?? {});
+
+        // ✅ Membership verified BEFORE socket.join — this is the security gate
+        await assertMembership(roomId, user._id);
+
         socket.join(roomId);
-        // Mark existing messages as read on join
+
+        // Mark all existing messages as read on join
         await markRoomAsRead(roomId, user._id);
+
         ack?.({ ok: true });
       } catch (err) {
-        ack?.({ ok: false, error: err.message });
+        ack?.(serializeError(err));
       }
     });
 
-    // ── leave:room ────────────────────────────────────────────────────────────
+    // ── leave:room ──────────────────────────────────────────────────────────
+    /**
+     * Graceful room exit. No auth check needed — leaving is always permitted.
+     * Also stops any in-progress typing indicator.
+     */
+    socket.on('leave:room', (payload) => {
+      const roomId = payload?.roomId;
+      if (!roomId) return;
 
-    socket.on('leave:room', (roomId) => {
+      const typingKey = `${roomId}:${user._id}`;
+      if (typingTimers.has(typingKey)) {
+        emitTypingUpdate(socket, roomId, false);
+        clearTypingTimer(typingKey);
+      }
+
       socket.leave(roomId);
     });
 
-    // ── message:send ──────────────────────────────────────────────────────────
+    // ── message:send ────────────────────────────────────────────────────────
     /**
-     * Expected payload:
-     * {
-     *   roomId:  string,
-     *   content: string,   // AES-256-GCM ciphertext "iv:ct" — never decrypted here
-     *   fileId?: string,   // Optional: ObjectId of a previously uploaded File
-     * }
+     * Send an encrypted message to a room.
+     *
+     * E2EE contract: `content` is AES-256-GCM ciphertext ("iv:ct" base64).
+     * This handler stores and broadcasts it without reading or modifying it.
+     *
+     * Payload: { roomId: string, content: string, fileId?: string }
+     * Ack:     { ok: true, messageId: string } | { ok: false, error, code }
+     *
+     * Flow:
+     *   1. Validate payload (Zod)
+     *   2. assertMembership (throws ForbiddenError if not a member)
+     *   3. createMessage (service → DB write)
+     *   4. io.to(roomId).emit — broadcast to all room members
+     *   5. ack sender
      */
     socket.on('message:send', async (payload, ack) => {
       try {
-        const { roomId, content, fileId } = payload ?? {};
+        const { roomId, content, fileId } = validate(SendMessageSchema, payload ?? {});
 
-        if (!roomId || !content) {
-          return ack?.({ ok: false, error: 'roomId and content are required.' });
-        }
-
-        await assertRoomMember(roomId, user._id);
-
-        // Delegate DB write to service — shared with GraphQL resolver
+        // createMessage internally calls assertMembership — one DB round trip
         const message = await createMessage({
           content,
           senderId: user._id,
           roomId,
-          fileId: fileId ?? null,
+          fileId:   fileId ?? null,
         });
 
-        // Broadcast to all clients in the room (including sender)
+        // Broadcast the full shaped event to all clients in the room
         io.to(roomId).emit('message:new', {
-          id:        message._id,
+          id:        message._id.toString(),
           content:   message.content,
-          sender:    {
-            id:        message.sender._id,
+          sender: {
+            id:        message.sender._id.toString(),
             username:  message.sender.username,
             publicKey: message.sender.publicKey,
           },
           file:      message.file ?? null,
           roomId,
-          createdAt: message.createdAt,
+          createdAt: message.createdAt.toISOString(),
         });
 
-        ack?.({ ok: true, messageId: message._id });
+        ack?.({ ok: true, messageId: message._id.toString() });
       } catch (err) {
-        console.error('[socket] message:send', err);
-        ack?.({ ok: false, error: err.message });
+        ack?.(serializeError(err));
       }
     });
 
-    // ── typing:start / typing:stop ────────────────────────────────────────────
+    // ── typing:start ────────────────────────────────────────────────────────
     /**
-     * Client emits typing:start when the user begins typing.
-     * Auto-stops after 3 s of no further events (debounce).
+     * Broadcast that this user started typing.
+     * Auto-stops after TYPING_TIMEOUT_MS with no further events (debounce).
+     * No DB access — pure in-memory state.
      */
-    socket.on('typing:start', async ({ roomId } = {}) => {
+    socket.on('typing:start', (payload) => {
+      const roomId = payload?.roomId;
       if (!roomId) return;
 
-      // Broadcast to others in the room
-      socket.to(roomId).emit('typing:update', {
-        userId:   user._id,
-        username: user.username,
-        roomId,
-        isTyping: true,
-      });
+      emitTypingUpdate(socket, roomId, true);
 
-      // Debounce: automatically send stop after 3 s
       const key = `${roomId}:${user._id}`;
-      clearTimeout(typingTimers.get(key));
+      clearTypingTimer(key); // reset debounce on each keystroke
       typingTimers.set(
         key,
         setTimeout(() => {
-          socket.to(roomId).emit('typing:update', {
-            userId:   user._id,
-            username: user.username,
-            roomId,
-            isTyping: false,
-          });
+          emitTypingUpdate(socket, roomId, false);
           typingTimers.delete(key);
         }, TYPING_TIMEOUT_MS)
       );
     });
 
-    socket.on('typing:stop', ({ roomId } = {}) => {
+    // ── typing:stop ─────────────────────────────────────────────────────────
+    /**
+     * Explicit stop (e.g. message sent, user blurred input).
+     * Cancels the debounce timer and immediately notifies room.
+     */
+    socket.on('typing:stop', (payload) => {
+      const roomId = payload?.roomId;
       if (!roomId) return;
 
       const key = `${roomId}:${user._id}`;
-      clearTimeout(typingTimers.get(key));
-      typingTimers.delete(key);
-
-      socket.to(roomId).emit('typing:update', {
-        userId:   user._id,
-        username: user.username,
-        roomId,
-        isTyping: false,
-      });
+      clearTypingTimer(key);
+      emitTypingUpdate(socket, roomId, false);
     });
 
-    // ── read:mark ─────────────────────────────────────────────────────────────
-
-    socket.on('read:mark', async ({ roomId } = {}) => {
+    // ── read:mark ───────────────────────────────────────────────────────────
+    /**
+     * Mark all messages in a room as read by this user.
+     * Notifies room peers so they can update read-receipt UI.
+     */
+    socket.on('read:mark', async (payload) => {
+      const roomId = payload?.roomId;
       if (!roomId) return;
-      await markRoomAsRead(roomId, user._id);
-      // Notify others that this user has read the room
-      socket.to(roomId).emit('read:update', {
-        userId: user._id,
-        roomId,
-      });
+
+      try {
+        await markRoomAsRead(roomId, user._id);
+        socket.to(roomId).emit('read:update', {
+          userId: user._id.toString(),
+          roomId,
+        });
+      } catch (err) {
+        // read:mark has no ack — just log
+        console.error('[socket] read:mark error:', err.message);
+      }
     });
 
-    // ── disconnect ────────────────────────────────────────────────────────────
+    // ── disconnect ──────────────────────────────────────────────────────────
+    /**
+     * Clean up:
+     *   1. Cancel all typing timers for this user
+     *   2. If this was the user's last socket, mark them offline
+     */
+    socket.on('disconnect', async (reason) => {
+      console.info(`[socket] - ${user.username} (${socket.id}) reason=${reason}`);
 
-    socket.on('disconnect', async () => {
-      console.log(`[socket] disconnected: ${user.username} (${socket.id})`);
-
-      // Clean up any pending typing timers for this socket
-      for (const [key, timer] of typingTimers.entries()) {
+      // Cancel any pending typing timers for this user across all rooms
+      for (const [key] of typingTimers) {
         if (key.endsWith(`:${user._id}`)) {
-          clearTimeout(timer);
-          typingTimers.delete(key);
+          clearTypingTimer(key);
         }
       }
 
-      // Check if user has any other active sockets before marking offline
-      const sockets = await io.fetchSockets();
-      const stillConnected = sockets.some(
-        (s) => s.id !== socket.id && s.user?._id.toString() === user._id.toString()
-      );
-
-      if (!stillConnected) {
-        await User.findByIdAndUpdate(user._id, { presence: 'offline' });
-        socket.broadcast.emit('presence:update', {
-          userId:   user._id,
-          presence: 'offline',
-        });
+      try {
+        const isLast = await isLastSocketForUser(io, socket.id, user._id);
+        if (isLast) {
+          await setPresence(user._id, 'offline');
+          socket.broadcast.emit('presence:update', {
+            userId:   user._id.toString(),
+            presence: 'offline',
+          });
+        }
+      } catch (err) {
+        console.error('[socket] disconnect cleanup error:', err.message);
       }
     });
   });

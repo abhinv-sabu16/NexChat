@@ -1,35 +1,51 @@
 /**
  * services/messageService.js
  *
- * Single source of truth for all message-related database operations.
+ * Single source of truth for all message database operations.
+ *
  * Both GraphQL resolvers and Socket.io handlers import from here.
- * No business logic lives outside this file.
+ * No Message or Room model is imported anywhere else for business logic.
  */
 
 import Message from '../models/Message.js';
-import Room    from '../models/Room.js';
+import { NotFoundError, ValidationError } from '../lib/errors.js';
+import { POPULATE, PAGINATION } from '../lib/constants.js';
+import { assertMembership } from './roomService.js';
+
+// ─── Shared populate config ───────────────────────────────────────────────────
+// Defined once here; both createMessage and getMessages use the same shape.
+
+const MESSAGE_POPULATE = [
+  { path: 'sender', select: POPULATE.USER_PUBLIC },
+  { path: 'file',   select: POPULATE.FILE_META   },
+];
 
 // ─── createMessage ────────────────────────────────────────────────────────────
 
 /**
- * Persists a new message to MongoDB.
+ * Validates, persists, and returns a new message.
+ *
+ * E2EE contract: `content` is opaque ciphertext. This function stores and
+ * returns it unchanged — the server never decrypts it.
  *
  * @param {object} params
- * @param {string} params.content    - AES-256-GCM ciphertext (base64, "iv:ct" format)
- * @param {string} params.senderId   - ObjectId of the sending user
- * @param {string} params.roomId     - ObjectId of the target room
- * @param {string} [params.fileId]   - Optional ObjectId of an attached File document
+ * @param {string}      params.content   - AES-256-GCM ciphertext ("iv:ct" base64)
+ * @param {string}      params.senderId  - Sender's ObjectId
+ * @param {string}      params.roomId    - Target room's ObjectId
+ * @param {string|null} [params.fileId]  - Optional attached File ObjectId
  *
- * @returns {Promise<object>} Populated message document (sender + file fields)
+ * @returns {Promise<object>} Populated message document
+ * @throws {ValidationError} If content or roomId are missing
+ * @throws {NotFoundError}   If room does not exist
+ * @throws {ForbiddenError}  If sender is not a room member
  */
 export async function createMessage({ content, senderId, roomId, fileId = null }) {
-  // 1. Verify room exists before inserting
-  const roomExists = await Room.exists({ _id: roomId });
-  if (!roomExists) {
-    throw new Error(`Room ${roomId} not found.`);
-  }
+  if (!content?.trim()) throw new ValidationError('Message content cannot be empty.');
+  if (!roomId)          throw new ValidationError('roomId is required.');
 
-  // 2. Persist the message (content is ciphertext — server never decrypts)
+  // Validates room exists + sender is a member (throws typed errors on failure)
+  await assertMembership(roomId, senderId);
+
   const message = await Message.create({
     content,
     sender: senderId,
@@ -37,54 +53,50 @@ export async function createMessage({ content, senderId, roomId, fileId = null }
     file:   fileId,
   });
 
-  // 3. Return populated document so callers get sender details immediately
-  return message.populate([
-    { path: 'sender', select: 'username publicKey presence' },
-    { path: 'file',   select: 'originalName mimeType sizeBytes s3Key encryptedFileKey' },
-  ]);
+  return message.populate(MESSAGE_POPULATE);
 }
 
 // ─── getMessages ──────────────────────────────────────────────────────────────
 
 /**
- * Retrieves paginated message history for a room.
+ * Retrieves cursor-paginated message history for a room.
  *
  * @param {object} params
- * @param {string} params.roomId  - ObjectId of the room
- * @param {number} [params.limit] - Max messages to return (default: 20, max: 100)
- * @param {string} [params.before]- ISO date string; return messages older than this (cursor)
+ * @param {string}      params.roomId  - Target room's ObjectId
+ * @param {number}      [params.limit] - Max messages (default 20, max 100)
+ * @param {string|null} [params.before]- ISO date cursor (return messages older than this)
  *
- * @returns {Promise<object[]>} Messages in ascending chronological order
+ * @returns {Promise<object[]>} Messages in ascending chronological order (oldest first)
  */
-export async function getMessages({ roomId, limit = 20, before = null }) {
-  const safeLimit = Math.min(Math.max(1, limit), 100);
+export async function getMessages({ roomId, limit = PAGINATION.MESSAGES_DEFAULT, before = null }) {
+  const safeLimit = Math.min(Math.max(1, limit), PAGINATION.MESSAGES_MAX);
 
-  const query = { room: roomId };
-
-  // Cursor-based pagination: fetch messages older than `before` timestamp
+  const filter = { room: roomId };
   if (before) {
-    query.createdAt = { $lt: new Date(before) };
+    const cursor = new Date(before);
+    if (isNaN(cursor.getTime())) throw new ValidationError('`before` must be a valid ISO date string.');
+    filter.createdAt = { $lt: cursor };
   }
 
-  const messages = await Message.find(query)
-    .sort({ createdAt: -1 })       // newest first for slicing
+  const messages = await Message.find(filter)
+    .sort({ createdAt: -1 })  // newest first — we reverse below for display order
     .limit(safeLimit)
-    .populate('sender', 'username publicKey presence')
-    .populate('file',   'originalName mimeType sizeBytes s3Key encryptedFileKey')
+    .populate(MESSAGE_POPULATE)
     .lean();
 
-  // Return in ascending order (oldest → newest) for correct chat rendering
+  // Return oldest → newest for correct chat UI rendering
   return messages.reverse();
 }
 
-// ─── markAsRead ───────────────────────────────────────────────────────────────
+// ─── markRoomAsRead ───────────────────────────────────────────────────────────
 
 /**
- * Marks all messages in a room as read by a user.
- * Used for read receipts — does not need to return updated docs.
+ * Marks all unread messages in a room as read by a user.
+ * Uses $addToSet to avoid duplicate entries.
  *
  * @param {string} roomId
  * @param {string} userId
+ * @returns {Promise<void>}
  */
 export async function markRoomAsRead(roomId, userId) {
   await Message.updateMany(

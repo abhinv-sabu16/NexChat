@@ -1,71 +1,65 @@
 /**
  * server/index.js
  *
- * Application entry point.
+ * Application entry point — pure orchestration, nothing else.
  *
- * Bootstraps three layers in a single HTTP server:
- *   1. Express  → REST (auth + file uploads)
- *   2. Apollo   → GraphQL (data fetching)
- *   3. Socket.io → Real-time messaging
+ * Each concern lives in its own module:
+ *   Database     → config/db.js
+ *   Apollo/GQL   → config/apollo.js
+ *   Auth/JWT     → middleware/auth.js
+ *   REST routes  → rest/*.routes.js
+ *   Sockets      → sockets/chat.socket.js
+ *   Errors       → middleware/errorHandler.js
  *
- * Strict separation:
- *   - Auth    → REST only
- *   - Uploads → REST only
- *   - Data    → GraphQL only
- *   - Events  → Socket.io only
+ * Three-layer architecture on one port:
+ *   REST      →  /api/*
+ *   GraphQL   →  /graphql
+ *   Socket.io →  ws://  (same HTTP server, upgraded connection)
  */
 
 import 'dotenv/config';
-import http       from 'http';
-import express    from 'express';
-import cors       from 'cors';
-import helmet     from 'helmet';
-import rateLimit  from 'express-rate-limit';
-import mongoose   from 'mongoose';
-import cookieParser from 'cookie-parser';
-
-import { ApolloServer }          from '@apollo/server';
-import { expressMiddleware }     from '@apollo/server/express4';
-import { ApolloServerPluginDrainHttpServer } from '@apollo/server/plugin/drainHttpServer';
-import { makeExecutableSchema }  from '@graphql-tools/schema';
+import http          from 'http';
+import express       from 'express';
+import cors          from 'cors';
+import helmet        from 'helmet';
+import rateLimit     from 'express-rate-limit';
+import cookieParser  from 'cookie-parser';
 import { Server as SocketIOServer } from 'socket.io';
+import { expressMiddleware } from '@apollo/server/express4';
 
-import { typeDefs }          from './graphql/schema.js';
-import { userResolvers }     from './graphql/resolvers/userResolver.js';
-import { roomResolvers }     from './graphql/resolvers/roomResolver.js';
-import { messageResolvers }  from './graphql/resolvers/messageResolver.js';
+import { connectDB }            from './config/db.js';
+import { createApolloServer, buildApolloContext } from './config/apollo.js';
+import { authRouter }           from './rest/auth.routes.js';
+import { fileRouter }           from './rest/file.routes.js';
+import { registerChatSocket }   from './sockets/chat.socket.js';
+import { errorHandler }         from './middleware/errorHandler.js';
 
-import { authRouter }        from './rest/auth.routes.js';
-import { fileRouter }        from './rest/file.routes.js';
+const PORT   = process.env.PORT ?? 4000;
+const IS_PROD = process.env.NODE_ENV === 'production';
 
-import { registerChatSocket } from './sockets/chat.socket.js';
-import { getUserFromToken, extractBearerToken } from './middleware/auth.js';
-
-const PORT = process.env.PORT ?? 4000;
-
-// ─── 1. Express app ───────────────────────────────────────────────────────────
+// ─── 1. Express ───────────────────────────────────────────────────────────────
 
 const app = express();
 
 app.use(helmet({
-  // Apollo Studio / GraphQL playground needs this relaxed in dev
-  contentSecurityPolicy: process.env.NODE_ENV === 'production',
+  // Relax CSP in development so Apollo Sandbox can load
+  contentSecurityPolicy: IS_PROD,
 }));
 
 app.use(cors({
   origin:      process.env.CLIENT_URL ?? 'http://localhost:3000',
-  credentials: true,                // allow cookies (refresh token)
+  credentials: true, // Required for refresh-token cookie
 }));
 
 app.use(cookieParser());
 app.use(express.json({ limit: '1mb' }));
 
-// Global rate limit for all non-auth routes
+// Global rate limit — auth routes have their own stricter limiter on top
 app.use(rateLimit({
-  windowMs: 60 * 1000,
-  max: 200,
+  windowMs:        60 * 1_000,
+  max:             300,
   standardHeaders: true,
-  legacyHeaders: false,
+  legacyHeaders:   false,
 }));
 
 // ─── 2. REST routes ───────────────────────────────────────────────────────────
@@ -73,79 +67,48 @@ app.use(rateLimit({
 app.use('/api/auth',  authRouter);
 app.use('/api/files', fileRouter);
 
-// ─── 3. HTTP server (shared with Socket.io) ───────────────────────────────────
+// ─── 3. HTTP + Socket.io server ───────────────────────────────────────────────
 
 const httpServer = http.createServer(app);
-
-// ─── 4. Socket.io ────────────────────────────────────────────────────────────
 
 const io = new SocketIOServer(httpServer, {
   cors: {
     origin:      process.env.CLIENT_URL ?? 'http://localhost:3000',
     credentials: true,
   },
-  // Automatic reconnection with exponential backoff is handled client-side
 });
 
 registerChatSocket(io);
 
-// ─── 5. Apollo Server (GraphQL) ───────────────────────────────────────────────
+// ─── 4. Apollo / GraphQL ──────────────────────────────────────────────────────
+// Apollo must be started before registering the Express middleware.
 
-// Merge all resolvers; later keys override earlier ones for same type
-const schema = makeExecutableSchema({
-  typeDefs,
-  resolvers: [userResolvers, roomResolvers, messageResolvers],
-});
+const apollo = await createApolloServer(httpServer);
 
-const apollo = new ApolloServer({
-  schema,
-  plugins: [
-    // Graceful shutdown: drain HTTP server before closing Apollo
-    ApolloServerPluginDrainHttpServer({ httpServer }),
-  ],
-  // Disable introspection and playground in production
-  introspection: process.env.NODE_ENV !== 'production',
-});
-
-await apollo.start();
-
-/**
- * Apollo context builder.
- * Runs on every GraphQL request.
- * Extracts the JWT from Authorization header and attaches the user.
- *
- * Resolvers check ctx.user and throw if authentication is required.
- */
 app.use(
   '/graphql',
   expressMiddleware(apollo, {
-    context: async ({ req }) => {
-      const token = extractBearerToken(req.headers.authorization);
-      const user  = await getUserFromToken(token);
-      return { user }; // ctx.user is null for unauthenticated requests
-    },
+    // Injects { user } into GraphQL context on every request.
+    // Resolvers call requireAuth(ctx) per-field — not enforced globally here.
+    context: buildApolloContext,
   })
 );
 
-// ─── 6. MongoDB ───────────────────────────────────────────────────────────────
+// ─── 5. Central error handler ─────────────────────────────────────────────────
+// Must be registered AFTER all routes.
 
-async function connectDB() {
-  const uri = process.env.MONGODB_URI;
-  if (!uri) throw new Error('MONGODB_URI is not set in environment.');
+app.use(errorHandler);
 
-  await mongoose.connect(uri);
-  console.log(`[db] Connected to MongoDB`);
-}
-
-// ─── 7. Boot ──────────────────────────────────────────────────────────────────
+// ─── 6. Boot ─────────────────────────────────────────────────────────────────
 
 async function start() {
   await connectDB();
 
   httpServer.listen(PORT, () => {
-    console.log(`[server] REST    → http://localhost:${PORT}/api`);
-    console.log(`[server] GraphQL → http://localhost:${PORT}/graphql`);
-    console.log(`[server] WS      → ws://localhost:${PORT}`);
+    console.info(`[server] REST    → http://localhost:${PORT}/api`);
+    console.info(`[server] GraphQL → http://localhost:${PORT}/graphql`);
+    console.info(`[server] WS      → ws://localhost:${PORT}`);
+    console.info(`[server] ENV     → ${process.env.NODE_ENV ?? 'development'}`);
   });
 }
 
