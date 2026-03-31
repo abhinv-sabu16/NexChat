@@ -1,0 +1,89 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap');
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  /* ── Palette ── */
+  --bg:           #121212;
+  --surface:      #1E1E1E;
+  --surface-2:    #252525;
+  --surface-3:    #2C2C2C;
+  --border:       rgba(255, 255, 255, 0.07);
+  --border-hover: rgba(255, 255, 255, 0.13);
+
+  --accent:       #6852D6;
+  --accent-hover: #7A65E0;
+  --accent-dim:   rgba(104, 82, 214, 0.18);
+  --accent-glow:  rgba(104, 82, 214, 0.35);
+
+  --success:      #57F287;
+  --success-dim:  rgba(87, 242, 135, 0.15);
+
+  --danger:       #ED4245;
+  --warning:      #FEE75C;
+
+  /* ── Text ── */
+  --text-primary:   #FFFFFF;
+  --text-secondary: #B0B0B0;
+  --text-muted:     #686868;
+  --text-inverse:   #121212;
+
+  /* ── Typography ── */
+  --font: 'Inter', system-ui, sans-serif;
+
+  /* ── Spacing ── */
+  --r-sm:  6px;
+  --r-md:  10px;
+  --r-lg:  16px;
+  --r-xl:  20px;
+  --r-full: 999px;
+
+  /* ── Transitions (minimal) ── */
+  --t-fast:   0.12s ease;
+  --t-normal: 0.2s ease;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  display: flex;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar       { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: var(--r-full); }
+::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
+
+/* ── Spin keyframe for loader ── */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes typingBounce {
+  0%, 60%, 100% { transform: translateY(0); }
+  30%           { transform: translateY(-4px); }
+}

@@ -1,86 +1,66 @@
-/**
- * App.jsx
- *
- * Root application component.
- *
- * Renders:
- *   - Loading spinner while bootstrapping auth session
- *   - Login / Register forms for unauthenticated users
- *   - Main chat layout (RoomList + ChatWindow) once authenticated
- *
- * Auth is managed by AuthContext; no token handling happens here.
- */
-
 import React, { useState } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext.jsx';
 import RoomList from './components/RoomList.jsx';
 import ChatWindow from './components/ChatWindow.jsx';
 import { getSocket } from './utils/socket.js';
 
-// ─── Inner app (consumes AuthContext) ─────────────────────────────────────────
+// ─── Lock icon SVG ────────────────────────────────────────────────────────────
+function LockIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+    </svg>
+  );
+}
 
+// ─── AppInner ─────────────────────────────────────────────────────────────────
 function AppInner() {
   const { user, loading, login, register, logout } = useAuth();
   const [activeRoomId, setActiveRoomId] = useState(null);
 
-  // ── Loading (bootstrapping session) ───────────────────────────────────────
   if (loading) {
     return (
-      <div style={styles.centered}>
-        <div style={styles.spinner} aria-label="Loading" />
+      <div style={styles.splash}>
+        <div style={styles.splashInner}>
+          <div style={styles.splashLogo}>N</div>
+          <div style={styles.spinner} />
+        </div>
       </div>
     );
   }
 
-  // ── Unauthenticated ───────────────────────────────────────────────────────
-  if (!user) {
-    return <AuthForm onLogin={login} onRegister={register} />;
-  }
+  if (!user) return <AuthForm onLogin={login} onRegister={register} />;
 
-  // ── Initialise socket once authenticated ──────────────────────────────────
-  // getSocket() is idempotent — safe to call on every render.
   getSocket();
 
-  // ── Main layout ───────────────────────────────────────────────────────────
   return (
     <div style={styles.app}>
-      {/* Sidebar */}
       <RoomList
         activeRoomId={activeRoomId}
-        onSelectRoom={(id) => setActiveRoomId(id)}
+        onSelectRoom={setActiveRoomId}
+        user={user}
+        onLogout={logout}
       />
-
-      {/* Chat area */}
       <ChatWindow roomId={activeRoomId} />
-
-      {/* User bar at bottom of sidebar — injected via CSS grid overlay */}
-      <div style={styles.userBar}>
-        <span style={styles.userAvatar}>{user.username[0].toUpperCase()}</span>
-        <span style={styles.username}>{user.username}</span>
-        <button style={styles.logoutBtn} onClick={logout} title="Log out">
-          ⏻
-        </button>
-      </div>
     </div>
   );
 }
 
-// ─── Auth form ────────────────────────────────────────────────────────────────
-
+// ─── AuthForm ─────────────────────────────────────────────────────────────────
 function AuthForm({ onLogin, onRegister }) {
-  const [mode,     setMode]     = useState('login'); // 'login' | 'register'
-  const [form,     setForm]     = useState({ username: '', email: '', password: '' });
-  const [busy,     setBusy]     = useState(false);
-  const [error,    setError]    = useState(null);
+  const [mode,  setMode]  = useState('login');
+  const [form,  setForm]  = useState({ username: '', email: '', password: '' });
+  const [busy,  setBusy]  = useState(false);
+  const [error, setError] = useState(null);
 
   const update = (field) => (e) =>
-    setForm((prev) => ({ ...prev, [field]: e.target.value }));
+    setForm((p) => ({ ...p, [field]: e.target.value }));
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setBusy(true);
     setError(null);
-
     try {
       if (mode === 'login') {
         await onLogin({ email: form.email, password: form.password });
@@ -95,89 +75,81 @@ function AuthForm({ onLogin, onRegister }) {
   };
 
   return (
-    <div style={styles.authWrap}>
+    <div style={styles.authBg}>
+      {/* Subtle ambient orb */}
+      <div style={styles.orb} />
+
       <div style={styles.authCard}>
         {/* Logo */}
-        <div style={styles.logo}>
-          <span style={styles.logoIcon}>💬</span>
-          <span style={styles.logoText}>NexChat</span>
+        <div style={styles.authLogo}>
+          <div style={styles.authLogoMark}>N</div>
+          <span style={styles.authLogoText}>NexChat</span>
         </div>
-        <p style={styles.tagline}>End-to-end encrypted messaging</p>
+
+        <p style={styles.authTagline}>
+          <LockIcon /> End-to-end encrypted messaging
+        </p>
 
         {/* Tab switcher */}
         <div style={styles.tabs}>
-          <button
-            style={{ ...styles.tab, ...(mode === 'login'    ? styles.tabActive : {}) }}
-            onClick={() => { setMode('login');    setError(null); }}
-          >
-            Log In
-          </button>
-          <button
-            style={{ ...styles.tab, ...(mode === 'register' ? styles.tabActive : {}) }}
-            onClick={() => { setMode('register'); setError(null); }}
-          >
-            Register
-          </button>
+          {['login', 'register'].map((t) => (
+            <button
+              key={t}
+              style={{ ...styles.tab, ...(mode === t ? styles.tabActive : {}) }}
+              onClick={() => { setMode(t); setError(null); }}
+            >
+              {t === 'login' ? 'Sign in' : 'Create account'}
+            </button>
+          ))}
         </div>
 
         {/* Form */}
         <form style={styles.form} onSubmit={handleSubmit}>
           {mode === 'register' && (
-            <label style={styles.label}>
-              Username
-              <input
-                style={styles.input}
-                type="text"
-                value={form.username}
-                onChange={update('username')}
-                autoComplete="username"
-                required
-                minLength={2}
-                maxLength={32}
-                disabled={busy}
-              />
-            </label>
+            <InputField
+              label="Username"
+              type="text"
+              value={form.username}
+              onChange={update('username')}
+              autoComplete="username"
+              disabled={busy}
+              minLength={2}
+              maxLength={32}
+              required
+            />
           )}
-
-          <label style={styles.label}>
-            Email
-            <input
-              style={styles.input}
-              type="email"
-              value={form.email}
-              onChange={update('email')}
-              autoComplete="email"
-              required
-              disabled={busy}
-            />
-          </label>
-
-          <label style={styles.label}>
-            Password
-            <input
-              style={styles.input}
-              type="password"
-              value={form.password}
-              onChange={update('password')}
-              autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-              required
-              minLength={8}
-              disabled={busy}
-            />
-          </label>
+          <InputField
+            label="Email"
+            type="email"
+            value={form.email}
+            onChange={update('email')}
+            autoComplete="email"
+            disabled={busy}
+            required
+          />
+          <InputField
+            label="Password"
+            type="password"
+            value={form.password}
+            onChange={update('password')}
+            autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+            disabled={busy}
+            minLength={8}
+            required
+          />
 
           {error && <div style={styles.authError}>{error}</div>}
 
-          <button type="submit" style={styles.submitBtn} disabled={busy}>
+          <button type="submit" style={{ ...styles.submitBtn, opacity: busy ? 0.6 : 1 }} disabled={busy}>
             {busy
-              ? (mode === 'login' ? 'Logging in…' : 'Creating account…')
-              : (mode === 'login' ? 'Log In'      : 'Create Account')}
+              ? (mode === 'login' ? 'Signing in…' : 'Creating account…')
+              : (mode === 'login' ? 'Sign in' : 'Create account')}
           </button>
         </form>
 
         {mode === 'register' && (
           <p style={styles.e2eeNote}>
-            🔒 A unique encryption key pair will be generated in your browser.
+            A unique encryption key pair will be generated in your browser.
             Your private key never leaves this device.
           </p>
         )}
@@ -186,8 +158,26 @@ function AuthForm({ onLogin, onRegister }) {
   );
 }
 
-// ─── Root export ──────────────────────────────────────────────────────────────
+function InputField({ label, ...props }) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <label style={styles.inputLabel}>
+      <span style={styles.inputLabelText}>{label}</span>
+      <input
+        {...props}
+        style={{
+          ...styles.input,
+          borderColor: focused ? 'var(--accent)' : 'var(--border)',
+          boxShadow: focused ? '0 0 0 3px var(--accent-dim)' : 'none',
+        }}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+      />
+    </label>
+  );
+}
 
+// ─── Root export ──────────────────────────────────────────────────────────────
 export default function App() {
   return (
     <AuthProvider>
@@ -197,190 +187,205 @@ export default function App() {
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
-
 const styles = {
   // App shell
   app: {
-    display:         'grid',
-    gridTemplateColumns: '240px 1fr',
-    gridTemplateRows:    '1fr 52px',
-    height:          '100vh',
-    overflow:        'hidden',
-    backgroundColor: '#16162a',
-    color:           '#e0e0ff',
-    fontFamily:      '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    display: 'flex',
+    width: '100%',
+    height: '100%',
+    overflow: 'hidden',
+    background: 'var(--bg)',
   },
-  userBar: {
-    gridColumn:      1,
-    gridRow:         2,
-    display:         'flex',
-    alignItems:      'center',
-    gap:             10,
-    padding:         '0 12px',
-    backgroundColor: '#16162e',
-    borderTop:       '1px solid #2a2a4e',
-    borderRight:     '1px solid #2a2a3e',
-  },
-  userAvatar: {
-    width:           30,
-    height:          30,
-    borderRadius:    '50%',
-    backgroundColor: '#4b3b7b',
-    display:         'flex',
-    alignItems:      'center',
-    justifyContent:  'center',
-    fontSize:        13,
-    fontWeight:      700,
-    color:           '#e0d0ff',
-    flexShrink:      0,
-  },
-  username: {
-    fontSize:     13,
-    fontWeight:   500,
-    color:        '#c0c0e0',
-    flex:         1,
-    overflow:     'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace:   'nowrap',
-  },
-  logoutBtn: {
-    background: 'none',
-    border:     'none',
-    color:      '#6060a0',
-    cursor:     'pointer',
-    fontSize:   16,
-    padding:    4,
-    borderRadius: 4,
-    lineHeight: 1,
-  },
-  // Loading
-  centered: {
-    height:         '100vh',
-    display:        'flex',
-    alignItems:     'center',
+
+  // Splash / loading
+  splash: {
+    height: '100vh',
+    width: '100vw',
+    display: 'flex',
+    alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#16162a',
+    background: 'var(--bg)',
+  },
+  splashInner: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: 20,
+  },
+  splashLogo: {
+    width: 52,
+    height: 52,
+    borderRadius: 16,
+    background: 'var(--accent)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: 26,
+    fontWeight: 900,
+    color: '#fff',
+    letterSpacing: '-1px',
+    fontFamily: 'var(--font)',
   },
   spinner: {
-    width:        32,
-    height:       32,
+    width: 22,
+    height: 22,
     borderRadius: '50%',
-    border:       '3px solid #3a3a6e',
-    borderTop:    '3px solid #7b5ea8',
-    animation:    'spin 0.8s linear infinite',
+    border: '2.5px solid var(--surface-3)',
+    borderTop: '2.5px solid var(--accent)',
+    animation: 'spin 0.7s linear infinite',
   },
+
   // Auth
-  authWrap: {
-    minHeight:       '100vh',
-    display:         'flex',
-    alignItems:      'center',
-    justifyContent:  'center',
-    backgroundColor: '#0f0f1e',
-    padding:         20,
-    fontFamily:      '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+  authBg: {
+    width: '100vw',
+    height: '100vh',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'var(--bg)',
+    position: 'relative',
+    overflow: 'hidden',
+    fontFamily: 'var(--font)',
+  },
+  orb: {
+    position: 'absolute',
+    width: 500,
+    height: 500,
+    borderRadius: '50%',
+    background: 'radial-gradient(circle, rgba(104,82,214,0.12) 0%, transparent 70%)',
+    top: '50%',
+    left: '50%',
+    transform: 'translate(-50%, -50%)',
+    pointerEvents: 'none',
   },
   authCard: {
-    backgroundColor: '#1a1a2e',
-    borderRadius:    16,
-    padding:         '32px 36px',
-    width:           '100%',
-    maxWidth:        380,
-    border:          '1px solid #2a2a4e',
-    boxShadow:       '0 8px 32px rgba(0,0,0,0.4)',
+    position: 'relative',
+    background: 'var(--surface)',
+    border: '1px solid var(--border)',
+    borderRadius: 20,
+    padding: '36px 40px',
+    width: '100%',
+    maxWidth: 400,
+    boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
+    animation: 'fadeIn 0.25s ease',
   },
-  logo: {
-    display:        'flex',
-    alignItems:     'center',
+  authLogo: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    marginBottom: 8,
     justifyContent: 'center',
-    gap:            10,
-    marginBottom:   6,
   },
-  logoIcon: { fontSize: 28 },
-  logoText: {
-    fontSize:   22,
-    fontWeight: 700,
-    color:      '#e0e0ff',
-    letterSpacing: '-0.02em',
+  authLogoMark: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    background: 'var(--accent)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: 22,
+    fontWeight: 900,
+    color: '#fff',
   },
-  tagline: {
-    textAlign:    'center',
-    fontSize:     13,
-    color:        '#6060a0',
-    margin:       '0 0 24px',
+  authLogoText: {
+    fontSize: 26,
+    fontWeight: 900,
+    color: 'var(--text-primary)',
+    letterSpacing: '-0.5px',
+  },
+  authTagline: {
+    textAlign: 'center',
+    fontSize: 12,
+    color: 'var(--text-muted)',
+    marginBottom: 24,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
   },
   tabs: {
-    display:         'flex',
-    borderRadius:    8,
-    backgroundColor: '#0f0f1e',
-    padding:         3,
-    marginBottom:    20,
-    gap:             3,
+    display: 'flex',
+    background: 'var(--bg)',
+    borderRadius: 10,
+    padding: 3,
+    marginBottom: 24,
+    gap: 3,
   },
   tab: {
-    flex:            1,
-    padding:         '7px 0',
-    border:          'none',
-    borderRadius:    6,
-    background:      'none',
-    color:           '#7070a0',
-    fontSize:        14,
-    fontWeight:      500,
-    cursor:          'pointer',
-    transition:      'background 0.15s, color 0.15s',
+    flex: 1,
+    padding: '8px 0',
+    border: 'none',
+    borderRadius: 8,
+    background: 'none',
+    color: 'var(--text-muted)',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'var(--font)',
+    transition: 'background var(--t-fast), color var(--t-fast)',
   },
   tabActive: {
-    backgroundColor: '#2a2a4e',
-    color:           '#e0e0ff',
+    background: 'var(--surface-3)',
+    color: 'var(--text-primary)',
   },
   form: {
-    display:       'flex',
+    display: 'flex',
     flexDirection: 'column',
-    gap:           14,
+    gap: 14,
   },
-  label: {
-    display:       'flex',
+  inputLabel: {
+    display: 'flex',
     flexDirection: 'column',
-    gap:           5,
-    fontSize:      13,
-    color:         '#8080b0',
-    fontWeight:    500,
+    gap: 6,
+  },
+  inputLabelText: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: 'var(--text-secondary)',
+    letterSpacing: '0.02em',
+    textTransform: 'uppercase',
   },
   input: {
-    padding:         '9px 12px',
-    borderRadius:    8,
-    border:          '1px solid #3a3a6e',
-    backgroundColor: '#0f0f1e',
-    color:           '#e0e0ff',
-    fontSize:        14,
-    outline:         'none',
-    fontFamily:      'inherit',
+    padding: '10px 14px',
+    borderRadius: 'var(--r-md)',
+    border: '1px solid var(--border)',
+    background: 'var(--bg)',
+    color: 'var(--text-primary)',
+    fontSize: 14,
+    fontFamily: 'var(--font)',
+    outline: 'none',
+    transition: 'border-color var(--t-fast), box-shadow var(--t-fast)',
   },
   authError: {
-    fontSize:        13,
-    color:           '#f87171',
-    backgroundColor: '#2a1a1a',
-    borderRadius:    8,
-    padding:         '8px 12px',
+    fontSize: 13,
+    color: 'var(--danger)',
+    background: 'rgba(237, 66, 69, 0.1)',
+    border: '1px solid rgba(237, 66, 69, 0.2)',
+    borderRadius: 'var(--r-sm)',
+    padding: '9px 12px',
   },
   submitBtn: {
-    padding:         '11px',
-    backgroundColor: '#5b3fa8',
-    border:          'none',
-    borderRadius:    8,
-    color:           '#fff',
-    fontSize:        15,
-    fontWeight:      600,
-    cursor:          'pointer',
-    marginTop:       4,
-    transition:      'opacity 0.15s',
+    padding: '11px',
+    background: 'var(--accent)',
+    border: 'none',
+    borderRadius: 'var(--r-md)',
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: 'pointer',
+    fontFamily: 'var(--font)',
+    marginTop: 4,
+    transition: 'background var(--t-fast), opacity var(--t-fast)',
   },
   e2eeNote: {
-    marginTop:  16,
-    fontSize:   12,
-    color:      '#5a5a8a',
+    marginTop: 16,
+    fontSize: 12,
+    color: 'var(--text-muted)',
     lineHeight: 1.6,
-    padding:    '10px 12px',
-    background: '#0f0f1e',
-    borderRadius: 8,
+    padding: '10px 12px',
+    background: 'var(--bg)',
+    borderRadius: 'var(--r-sm)',
+    border: '1px solid var(--border)',
   },
 };

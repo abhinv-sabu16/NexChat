@@ -1,77 +1,66 @@
-/**
- * components/FileUpload.jsx
- *
- * Handles client-side file encryption and upload.
- *
- * Flow:
- *   1. User selects a file
- *   2. Derive ECDH shared key with recipient
- *   3. Encrypt file bytes + file key (two-layer scheme)
- *   4. POST encrypted blob to /api/files/upload
- *   5. Call onUploaded(fileDoc) so parent can attach fileId to the message
- *
- * Props:
- *   roomId      {string}    Target room ID
- *   recipient   {object}    Member object with { id, publicKey } for key derivation
- *   onUploaded  {function}  Called with file metadata doc on success
- *   onCancel    {function}  Called when user dismisses the picker
- */
-
 import React, { useRef, useState } from 'react';
 import { uploadEncryptedFile } from '../utils/api.js';
 import { encryptFile, deriveSharedKey } from '../utils/crypto.js';
 
-const MAX_SIZE_MB = 50;
+const MAX_SIZE_MB    = 50;
 const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
 
-export default function FileUpload({ roomId, recipient, onUploaded, onCancel }) {
-  const inputRef             = useRef(null);
-  const [file,       setFile]       = useState(null);
-  const [progress,   setProgress]   = useState(null); // null | 'encrypting' | 'uploading' | 'done'
-  const [error,      setError]      = useState(null);
+function UploadIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+      <polyline points="17 8 12 3 7 8"/>
+      <line x1="12" y1="3" x2="12" y2="15"/>
+    </svg>
+  );
+}
 
-  // ── File selection ─────────────────────────────────────────────────────────
+export default function FileUpload({ roomId, recipient, onUploaded, onCancel }) {
+  const inputRef                     = useRef(null);
+  const [file,     setFile]          = useState(null);
+  const [progress, setProgress]      = useState(null);
+  const [error,    setError]         = useState(null);
+  const [isDragging, setIsDragging]  = useState(false);
 
   const handleFileChange = (e) => {
     const selected = e.target.files?.[0];
     if (!selected) return;
-
     if (selected.size > MAX_SIZE_BYTES) {
       setError(`File exceeds ${MAX_SIZE_MB} MB limit.`);
       return;
     }
-
     setFile(selected);
     setError(null);
   };
 
-  // ── Upload ────────────────────────────────────────────────────────────────
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const dropped = e.dataTransfer.files?.[0];
+    if (!dropped) return;
+    if (dropped.size > MAX_SIZE_BYTES) {
+      setError(`File exceeds ${MAX_SIZE_MB} MB limit.`);
+      return;
+    }
+    setFile(dropped);
+    setError(null);
+  };
 
   const handleUpload = async () => {
     if (!file || !recipient?.publicKey) {
       setError('Missing file or recipient public key.');
       return;
     }
-
     setError(null);
-
     try {
-      // 1. Derive shared key with recipient
       setProgress('encrypting');
       const sharedKey = await deriveSharedKey(recipient.publicKey);
-
-      // 2. Encrypt file (two-layer: file bytes + file key)
       const { encryptedBlob, encryptedFileKey, originalName, mimeType } =
         await encryptFile(file, sharedKey);
 
-      // 3. Upload encrypted blob to S3 via our REST endpoint
       setProgress('uploading');
       const fileDoc = await uploadEncryptedFile({
-        encryptedBlob,
-        encryptedFileKey,
-        originalName,
-        mimeType,
-        roomId,
+        encryptedBlob, encryptedFileKey, originalName, mimeType, roomId,
       });
 
       setProgress('done');
@@ -84,11 +73,14 @@ export default function FileUpload({ roomId, recipient, onUploaded, onCancel }) 
 
   const isWorking = progress === 'encrypting' || progress === 'uploading';
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  const progressLabel = {
+    encrypting: { icon: '🔒', text: 'Encrypting file…' },
+    uploading:  { icon: '☁️', text: 'Uploading to server…' },
+    done:       { icon: '✅', text: 'Upload complete' },
+  }[progress] ?? null;
 
   return (
     <div style={styles.wrapper}>
-      {/* Hidden file input */}
       <input
         ref={inputRef}
         type="file"
@@ -98,34 +90,48 @@ export default function FileUpload({ roomId, recipient, onUploaded, onCancel }) 
       />
 
       {!file ? (
-        /* Step 1: pick a file */
-        <div style={styles.dropzone} onClick={() => inputRef.current?.click()}>
-          <span style={styles.dropIcon}>📎</span>
-          <span style={styles.dropText}>
-            Click to select a file
-            <br />
-            <small style={styles.dropHint}>Max {MAX_SIZE_MB} MB · Encrypted before upload</small>
+        <div
+          style={{
+            ...styles.dropzone,
+            borderColor: isDragging ? 'var(--accent)' : 'var(--border)',
+            background: isDragging ? 'var(--accent-dim)' : 'transparent',
+          }}
+          onClick={() => inputRef.current?.click()}
+          onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+          onDragLeave={() => setIsDragging(false)}
+          onDrop={handleDrop}
+        >
+          <span style={{ color: isDragging ? 'var(--accent)' : 'var(--text-muted)' }}>
+            <UploadIcon />
           </span>
+          <div style={styles.dropText}>
+            <span style={styles.dropMain}>Drop file or click to browse</span>
+            <span style={styles.dropSub}>Max {MAX_SIZE_MB} MB · Encrypted before upload</span>
+          </div>
         </div>
       ) : (
-        /* Step 2: confirm and upload */
         <div style={styles.preview}>
-          <div style={styles.previewInfo}>
-            <span style={styles.fileIcon}>📄</span>
-            <div>
-              <div style={styles.fileName}>{file.name}</div>
-              <div style={styles.fileMeta}>
-                {(file.size / 1024).toFixed(1)} KB · {file.type || 'unknown type'}
-              </div>
+          {/* File info */}
+          <div style={styles.previewRow}>
+            <div style={styles.fileIconBox}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+            </div>
+            <div style={styles.fileDetails}>
+              <span style={styles.fileName}>{file.name}</span>
+              <span style={styles.fileMeta}>
+                {(file.size / 1024).toFixed(1)} KB · {file.type || 'unknown'}
+              </span>
             </div>
           </div>
 
-          {/* Progress indicator */}
-          {progress && (
-            <div style={styles.progress}>
-              {progress === 'encrypting' && '🔒 Encrypting…'}
-              {progress === 'uploading'  && '☁️  Uploading…'}
-              {progress === 'done'       && '✅ Done'}
+          {/* Progress bar */}
+          {progressLabel && (
+            <div style={styles.progressRow}>
+              <span>{progressLabel.icon}</span>
+              <span style={styles.progressText}>{progressLabel.text}</span>
             </div>
           )}
 
@@ -136,16 +142,9 @@ export default function FileUpload({ roomId, recipient, onUploaded, onCancel }) 
           {!isWorking && progress !== 'done' && (
             <div style={styles.actions}>
               <button style={styles.btnPrimary} onClick={handleUpload}>
-                Upload Encrypted
+                Upload encrypted
               </button>
-              <button
-                style={styles.btnSecondary}
-                onClick={() => {
-                  setFile(null);
-                  setError(null);
-                  setProgress(null);
-                }}
-              >
+              <button style={styles.btnSecondary} onClick={() => { setFile(null); setError(null); setProgress(null); }}>
                 Change
               </button>
               <button style={styles.btnSecondary} onClick={onCancel}>
@@ -156,83 +155,125 @@ export default function FileUpload({ roomId, recipient, onUploaded, onCancel }) 
         </div>
       )}
 
-      {/* Top-level error (e.g. file too large) */}
       {!file && error && <div style={styles.error}>{error}</div>}
     </div>
   );
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
-
 const styles = {
   wrapper: {
-    backgroundColor: '#1e1e36',
-    border:          '1px solid #3a3a5e',
-    borderRadius:    10,
-    padding:         12,
-    marginBottom:    8,
+    padding: '10px 0',
   },
   dropzone: {
-    display:         'flex',
-    alignItems:      'center',
-    gap:             12,
-    padding:         '12px 16px',
-    border:          '2px dashed #4a4a7e',
-    borderRadius:    8,
-    cursor:          'pointer',
-    color:           '#9090c0',
-    transition:      'border-color 0.15s',
-  },
-  dropIcon:  { fontSize: 24 },
-  dropText:  { fontSize: 13, lineHeight: 1.5 },
-  dropHint:  { color: '#6060a0' },
-  preview: {
-    display:       'flex',
-    flexDirection: 'column',
-    gap:           8,
-  },
-  previewInfo: {
-    display:    'flex',
+    display: 'flex',
     alignItems: 'center',
-    gap:        10,
+    gap: 12,
+    padding: '14px 16px',
+    border: '1.5px dashed var(--border)',
+    borderRadius: 'var(--r-lg)',
+    cursor: 'pointer',
+    transition: 'border-color var(--t-fast), background var(--t-fast)',
   },
-  fileIcon:  { fontSize: 24 },
-  fileName:  { fontSize: 14, fontWeight: 500, color: '#e0e0ff' },
-  fileMeta:  { fontSize: 12, color: '#7070a0', marginTop: 2 },
-  progress: {
-    fontSize:   13,
-    color:      '#a0a0d0',
-    padding:    '4px 0',
+  dropText: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+  },
+  dropMain: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: 'var(--text-secondary)',
+  },
+  dropSub: {
+    fontSize: 11,
+    color: 'var(--text-muted)',
+  },
+  preview: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 10,
+    padding: '10px 12px',
+    background: 'var(--surface-2)',
+    borderRadius: 'var(--r-lg)',
+    border: '1px solid var(--border)',
+  },
+  previewRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+  },
+  fileIconBox: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    background: 'var(--accent-dim)',
+    border: '1px solid rgba(104,82,214,0.25)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  fileDetails: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+    minWidth: 0,
+  },
+  fileName: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: 'var(--text-primary)',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  },
+  fileMeta: {
+    fontSize: 11,
+    color: 'var(--text-muted)',
+  },
+  progressRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 7,
+    fontSize: 13,
+  },
+  progressText: {
+    color: 'var(--text-secondary)',
   },
   error: {
-    fontSize:        13,
-    color:           '#f87171',
-    backgroundColor: '#2a1e1e',
-    borderRadius:    6,
-    padding:         '6px 10px',
+    fontSize: 12,
+    color: 'var(--danger)',
+    background: 'rgba(237,66,69,0.1)',
+    border: '1px solid rgba(237,66,69,0.2)',
+    borderRadius: 'var(--r-sm)',
+    padding: '7px 10px',
   },
   actions: {
-    display:   'flex',
-    gap:       8,
-    flexWrap:  'wrap',
+    display: 'flex',
+    gap: 7,
+    flexWrap: 'wrap',
   },
   btnPrimary: {
-    padding:         '7px 14px',
-    backgroundColor: '#5b3fa8',
-    border:          'none',
-    borderRadius:    6,
-    color:           '#fff',
-    fontSize:        13,
-    cursor:          'pointer',
-    fontWeight:      500,
+    padding: '7px 14px',
+    background: 'var(--accent)',
+    border: 'none',
+    borderRadius: 'var(--r-sm)',
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 700,
+    cursor: 'pointer',
+    fontFamily: 'var(--font)',
   },
   btnSecondary: {
-    padding:         '7px 14px',
-    backgroundColor: '#2a2a4e',
-    border:          '1px solid #4a4a7e',
-    borderRadius:    6,
-    color:           '#c0c0e0',
-    fontSize:        13,
-    cursor:          'pointer',
+    padding: '7px 14px',
+    background: 'var(--surface-3)',
+    border: '1px solid var(--border)',
+    borderRadius: 'var(--r-sm)',
+    color: 'var(--text-secondary)',
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'var(--font)',
   },
 };
