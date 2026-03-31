@@ -11,7 +11,7 @@
  * On any 401, the client silently refreshes the token and retries once.
  */
 
-const BASE_URL = process.env.VITE_SERVER_URL?? 'http://localhost:4000';
+const BASE_URL = import.meta.env.VITE_SERVER_URL?? 'http://localhost:4000';
 const GQL_URL  = `${BASE_URL}/graphql`;
 
 // ─── In-memory token store ────────────────────────────────────────────────────

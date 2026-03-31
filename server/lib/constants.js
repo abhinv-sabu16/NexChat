@@ -36,7 +36,7 @@ export const REFRESH_TOKEN_COOKIE = {
   OPTIONS: {
     httpOnly: true,
     secure:   IS_PROD,
-    sameSite: IS_PROD ? 'strict' : 'lax',
+    sameSite: IS_PROD ? 'none' : 'lax',
     maxAge:   7 * 24 * 60 * 60 * 1000, // 7 days in ms
   },
 };

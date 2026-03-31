@@ -12,7 +12,7 @@
 import { io } from 'socket.io-client';
 import { getAccessToken } from './api.js';
 
-const SERVER_URL = process.env.VITE_SERVER_URL?? 'http://localhost:4000';
+const SERVER_URL = import.meta.env.VITE_SERVER_URL?? 'http://localhost:4000';
 
 // ─── Singleton socket instance ────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ export function getSocket() {
     reconnectionDelay:   1_000,
     reconnectionDelayMax: 10_000,
 
-    transports: ['websocket'],
+    transports: ['websocket', 'polling'],
   });
 
   socket.on('connect', () =>

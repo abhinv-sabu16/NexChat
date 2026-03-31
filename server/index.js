@@ -46,8 +46,21 @@ app.use(helmet({
   contentSecurityPolicy: IS_PROD,
 }));
 
+const ALLOWED_ORIGINS = new Set([
+  process.env.CLIENT_URL,          // https://nex-chat-coral.vercel.app
+  'http://localhost:5173',         // Vite dev server
+  'http://localhost:3000',         // fallback
+].filter(Boolean));
+
 app.use(cors({
-  origin:      process.env.CLIENT_URL ?? 'http://localhost:3000',
+  origin: (origin, callback) => {
+    // Allow requests with no origin (curl, Postman, server-to-server)
+    if (!origin || ALLOWED_ORIGINS.has(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS: origin ${origin} not allowed`));
+    }
+  },
   credentials: true, // Required for refresh-token cookie
 }));
 
@@ -73,7 +86,10 @@ const httpServer = http.createServer(app);
 
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin:      process.env.CLIENT_URL ?? 'http://localhost:3000',
+    origin: (origin, callback) => {
+      if (!origin || ALLOWED_ORIGINS.has(origin)) callback(null, true);
+      else callback(new Error(`CORS: origin ${origin} not allowed`));
+    },
     credentials: true,
   },
 });
