@@ -1,154 +1,277 @@
-// client/src/utils/crypto.js
-// All cryptographic operations run in the browser via the Web Crypto API.
-// The server stores and transmits only ciphertext — it never sees plaintext.
+/**
+ * utils/crypto.js
+ *
+ * End-to-end encryption layer. Runs entirely in the browser.
+ * The server never sees plaintext — only ciphertext is transmitted.
+ *
+ * Protocol:
+ *   1. On registration, generate an ECDH P-256 key pair
+ *   2. Upload the public key to the server; store private key in IndexedDB
+ *   3. To message user B: derive shared key via ECDH(myPrivate, B.publicKey)
+ *   4. Encrypt with AES-256-GCM using a fresh 96-bit IV per message
+ *   5. Ciphertext format: "<iv_base64>:<ciphertext_base64>"
+ *
+ * File encryption (two-layer):
+ *   - Generate a random AES-256 key per file
+ *   - Encrypt file bytes with that key
+ *   - Encrypt that key with the ECDH shared key
+ *   - Store encrypted blob on S3, encrypted file key in MongoDB
+ */
 
-const ALGO       = 'AES-GCM';
-const KEY_LENGTH = 256;
-const IV_LENGTH  = 12; // 96-bit IV recommended for GCM
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-// ── ECDH Key Pair ──────────────────────────────
+const DB_NAME    = 'nexchat-keys';
+const DB_VERSION = 1;
+const KEY_STORE  = 'keypairs';
+const MY_KEY_ID  = 'self';
 
-/** Generate an ECDH P-256 key pair. Stores private key in IndexedDB. */
+// ─── IndexedDB helpers ────────────────────────────────────────────────────────
+
+function openKeyStore() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+
+    req.onupgradeneeded = (e) => {
+      e.target.result.createObjectStore(KEY_STORE);
+    };
+
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror   = ()  => reject(new Error('Failed to open IndexedDB key store.'));
+  });
+}
+
+async function storePrivateKey(privateKey) {
+  const db = await openKeyStore();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(KEY_STORE, 'readwrite');
+    const req = tx.objectStore(KEY_STORE).put(privateKey, MY_KEY_ID);
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(new Error('Failed to store private key.'));
+  });
+}
+
+async function loadPrivateKey() {
+  const db = await openKeyStore();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(KEY_STORE, 'readonly');
+    const req = tx.objectStore(KEY_STORE).get(MY_KEY_ID);
+    req.onsuccess = (e) => resolve(e.target.result ?? null);
+    req.onerror   = () => reject(new Error('Failed to load private key.'));
+  });
+}
+
+// ─── Base64 helpers ───────────────────────────────────────────────────────────
+
+export function bufferToBase64(buffer) {
+  return btoa(String.fromCharCode(...new Uint8Array(buffer)));
+}
+
+export function base64ToBuffer(b64) {
+  const binary = atob(b64);
+  const buf    = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
+  return buf.buffer;
+}
+
+// ─── Key generation ───────────────────────────────────────────────────────────
+
+/**
+ * Generates a new ECDH P-256 key pair.
+ * Stores the private key in IndexedDB (never leaves the browser).
+ * Returns the public key as a base64 string for upload to the server.
+ *
+ * @returns {Promise<string>} base64-encoded public key (SubjectPublicKeyInfo)
+ */
 export async function generateKeyPair() {
   const keyPair = await crypto.subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' },
-    true,
-    ['deriveKey', 'deriveBits']
+    false, // private key is not extractable
+    ['deriveKey']
   );
-  const publicKeyJwk  = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
-  const privateKeyJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
-  await storePrivateKey(privateKeyJwk);
-  return { publicKeyJwk, privateKeyJwk };
+
+  // Store private key in IndexedDB — never extractable, never leaves browser
+  await storePrivateKey(keyPair.privateKey);
+
+  // Export public key as base64 for server upload
+  const publicKeyBuffer = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+  return bufferToBase64(publicKeyBuffer);
 }
 
-/** Derive a shared AES-256-GCM key from our private key + their public key. */
-export async function deriveSharedKey(ourPrivateKeyJwk, theirPublicKeyJwk) {
-  const ourPrivateKey = await crypto.subtle.importKey(
-    'jwk', ourPrivateKeyJwk,
-    { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveKey']
+/**
+ * Returns true if a key pair already exists in IndexedDB.
+ */
+export async function hasKeyPair() {
+  const key = await loadPrivateKey();
+  return key !== null;
+}
+
+// ─── Shared key derivation ────────────────────────────────────────────────────
+
+/**
+ * Derives a shared AES-256-GCM key from our private key and a peer's public key.
+ * ECDH(A.private, B.public) === ECDH(B.private, A.public) — same shared secret.
+ *
+ * @param {string} peerPublicKeyB64 - base64-encoded peer public key from server
+ * @returns {Promise<CryptoKey>} AES-GCM key usable for encrypt/decrypt
+ */
+export async function deriveSharedKey(peerPublicKeyB64) {
+  const privateKey = await loadPrivateKey();
+  if (!privateKey) throw new Error('No private key found. Please re-register.');
+
+  const peerPublicKey = await crypto.subtle.importKey(
+    'spki',
+    base64ToBuffer(peerPublicKeyB64),
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false,
+    []
   );
-  const theirPublicKey = await crypto.subtle.importKey(
-    'jwk', theirPublicKeyJwk,
-    { name: 'ECDH', namedCurve: 'P-256' }, false, []
-  );
+
   return crypto.subtle.deriveKey(
-    { name: 'ECDH', public: theirPublicKey },
-    ourPrivateKey,
-    { name: ALGO, length: KEY_LENGTH },
+    { name: 'ECDH', public: peerPublicKey },
+    privateKey,
+    { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
   );
 }
 
-// ── Message Encryption ─────────────────────────
+// ─── Message encryption ───────────────────────────────────────────────────────
 
-/** Encrypt plaintext → { encryptedContent, iv } (both Base64) */
+/**
+ * Encrypts a plaintext message string with a shared AES-256-GCM key.
+ *
+ * @param {string}    plaintext
+ * @param {CryptoKey} sharedKey - from deriveSharedKey()
+ * @returns {Promise<string>} "<iv_base64>:<ciphertext_base64>"
+ */
 export async function encryptMessage(plaintext, sharedKey) {
-  const iv      = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-  const encoded = new TextEncoder().encode(plaintext);
-  const cipher  = await crypto.subtle.encrypt({ name: ALGO, iv }, sharedKey, encoded);
-  return {
-    encryptedContent: toBase64(cipher),
-    iv:               toBase64(iv.buffer),
-  };
-}
-
-/** Decrypt ciphertext → plaintext string */
-export async function decryptMessage(encryptedContent, iv, sharedKey) {
-  const plain = await crypto.subtle.decrypt(
-    { name: ALGO, iv: new Uint8Array(fromBase64(iv)) },
+  const iv         = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV
+  const encoded    = new TextEncoder().encode(plaintext);
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
     sharedKey,
-    fromBase64(encryptedContent)
+    encoded
   );
-  return new TextDecoder().decode(plain);
+
+  return `${bufferToBase64(iv.buffer)}:${bufferToBase64(ciphertext)}`;
 }
 
-// ── File Encryption ────────────────────────────
+/**
+ * Decrypts a ciphertext string produced by encryptMessage().
+ *
+ * @param {string}    ciphertext - "<iv_base64>:<ciphertext_base64>"
+ * @param {CryptoKey} sharedKey
+ * @returns {Promise<string>} Decrypted plaintext
+ */
+export async function decryptMessage(ciphertext, sharedKey) {
+  const [ivB64, ctB64] = ciphertext.split(':');
+  if (!ivB64 || !ctB64) throw new Error('Malformed ciphertext — expected "iv:ct" format.');
 
-/** Encrypt a file with a fresh random key; wrap that key with the shared key. */
-export async function encryptFile(fileBuffer, sharedKey) {
+  const iv        = base64ToBuffer(ivB64);
+  const ct        = base64ToBuffer(ctB64);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(iv) },
+    sharedKey,
+    ct
+  );
+
+  return new TextDecoder().decode(plaintext);
+}
+
+// ─── File encryption (two-layer) ─────────────────────────────────────────────
+
+/**
+ * Encrypts a File object for upload.
+ *
+ * @param {File}      file       - Browser File object
+ * @param {CryptoKey} sharedKey  - ECDH shared key (encrypts the file key)
+ *
+ * @returns {Promise<{
+ *   encryptedBlob:    Blob,   - Encrypted file bytes for S3 upload
+ *   encryptedFileKey: string, - base64: file AES key encrypted with sharedKey
+ *   originalName:     string,
+ *   mimeType:         string,
+ * }>}
+ */
+export async function encryptFile(file, sharedKey) {
+  // 1. Generate a fresh random AES-256 key for this file
   const fileKey = await crypto.subtle.generateKey(
-    { name: ALGO, length: KEY_LENGTH }, true, ['encrypt', 'decrypt']
+    { name: 'AES-GCM', length: 256 },
+    true, // must be extractable so we can encrypt it
+    ['encrypt']
   );
-  const fileIv     = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-  const cipherFile = await crypto.subtle.encrypt(
-    { name: ALGO, iv: fileIv }, fileKey, fileBuffer
+
+  // 2. Encrypt file bytes with the file key
+  const fileIv      = crypto.getRandomValues(new Uint8Array(12));
+  const fileBuffer  = await file.arrayBuffer();
+  const encryptedFile = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: fileIv },
+    fileKey,
+    fileBuffer
   );
-  const rawKey      = await crypto.subtle.exportKey('raw', fileKey);
-  const keyIv       = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-  const wrappedKey  = await crypto.subtle.encrypt(
-    { name: ALGO, iv: keyIv }, sharedKey, rawKey
+
+  // Prepend IV to ciphertext so the recipient has it
+  const combined = new Uint8Array(fileIv.length + encryptedFile.byteLength);
+  combined.set(fileIv, 0);
+  combined.set(new Uint8Array(encryptedFile), fileIv.length);
+
+  // 3. Export and encrypt the file key with the ECDH shared key
+  const rawFileKey    = await crypto.subtle.exportKey('raw', fileKey);
+  const keyIv         = crypto.getRandomValues(new Uint8Array(12));
+  const encryptedKey  = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: keyIv },
+    sharedKey,
+    rawFileKey
   );
+
+  const encryptedFileKey = `${bufferToBase64(keyIv.buffer)}:${bufferToBase64(encryptedKey)}`;
+
   return {
-    encryptedFile:    cipherFile,
-    encryptedFileKey: toBase64(wrappedKey),
-    iv:               toBase64(fileIv.buffer),
-    fileKeyIv:        toBase64(keyIv.buffer),
+    encryptedBlob:    new Blob([combined], { type: 'application/octet-stream' }),
+    encryptedFileKey,
+    originalName:     file.name,
+    mimeType:         file.type || 'application/octet-stream',
   };
 }
 
-/** Decrypt a downloaded file. */
-export async function decryptFile(encryptedFile, encryptedFileKey, iv, fileKeyIv, sharedKey) {
-  const rawKey = await crypto.subtle.decrypt(
-    { name: ALGO, iv: new Uint8Array(fromBase64(fileKeyIv)) },
+/**
+ * Decrypts a file blob downloaded from S3.
+ *
+ * @param {ArrayBuffer} encryptedBuffer  - Raw bytes from S3 (iv prepended)
+ * @param {string}      encryptedFileKey - "<iv_base64>:<encrypted_key_base64>"
+ * @param {CryptoKey}   sharedKey        - ECDH shared key
+ * @param {string}      mimeType         - Original MIME type for the returned Blob
+ *
+ * @returns {Promise<Blob>} Decrypted file as a Blob
+ */
+export async function decryptFile(encryptedBuffer, encryptedFileKey, sharedKey, mimeType) {
+  // 1. Decrypt the file key
+  const [keyIvB64, encKeyB64] = encryptedFileKey.split(':');
+  const keyIv    = new Uint8Array(base64ToBuffer(keyIvB64));
+  const encKey   = base64ToBuffer(encKeyB64);
+  const rawFileKey = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: keyIv },
     sharedKey,
-    fromBase64(encryptedFileKey)
+    encKey
   );
+
   const fileKey = await crypto.subtle.importKey(
-    'raw', rawKey, { name: ALGO, length: KEY_LENGTH }, false, ['decrypt']
+    'raw',
+    rawFileKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt']
   );
-  return crypto.subtle.decrypt(
-    { name: ALGO, iv: new Uint8Array(fromBase64(iv)) },
+
+  // 2. Split IV and ciphertext from the downloaded buffer
+  const fileIv = new Uint8Array(encryptedBuffer, 0, 12);
+  const ct     = encryptedBuffer.slice(12);
+
+  const decrypted = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: fileIv },
     fileKey,
-    encryptedFile
+    ct
   );
-}
 
-// ── IndexedDB Key Storage ──────────────────────
-
-const DB_NAME = 'nexchat-keys';
-
-function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = (e) => e.target.result.createObjectStore('keys');
-    req.onsuccess = (e) => resolve(e.target.result);
-    req.onerror   = () => reject(req.error);
-  });
-}
-
-export async function storePrivateKey(keyJwk) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('keys', 'readwrite');
-    tx.objectStore('keys').put(keyJwk, 'privateKey');
-    tx.oncomplete = resolve;
-    tx.onerror    = () => reject(tx.error);
-  });
-}
-
-export async function loadPrivateKey() {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx  = db.transaction('keys', 'readonly');
-    const req = tx.objectStore('keys').get('privateKey');
-    req.onsuccess = () => {
-      if (req.result) resolve(req.result);
-      else reject(new Error('No private key found'));
-    };
-    req.onerror = () => reject(req.error);
-  });
-}
-
-// ── Helpers ────────────────────────────────────
-
-function toBase64(buffer) {
-  return btoa(String.fromCharCode(...new Uint8Array(buffer)));
-}
-
-function fromBase64(b64) {
-  const bin   = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes.buffer;
+  return new Blob([decrypted], { type: mimeType });
 }

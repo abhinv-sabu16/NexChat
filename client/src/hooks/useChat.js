@@ -1,275 +1,339 @@
-// client/hooks/useChat.js — React hook for real-time chat
+/**
+ * hooks/useChat.js
+ *
+ * Primary chat hook. Manages the full lifecycle of a chat room:
+ *   - Load room + message history via GraphQL
+ *   - Join the Socket.io room (after GraphQL data arrives)
+ *   - Send encrypted messages
+ *   - Receive real-time messages and decrypt them
+ *   - Typing indicators (debounced)
+ *   - Presence updates
+ *   - Read receipts
+ *   - Paginated history loading
+ *
+ * E2EE: messages are encrypted before emit and decrypted on receipt.
+ * The hook derives shared keys per sender and caches them to avoid
+ * redundant ECDH operations.
+ *
+ * @param {string|null} roomId - ID of the room to join. null = no active room.
+ */
+
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { io } from 'socket.io-client';
+import { gql, QUERIES, getFileDownloadUrl } from '../utils/api.js';
 import {
-  loadPrivateKey,
+  getSocket,
+  joinRoom,
+  leaveRoom,
+  sendMessage as socketSendMessage,
+  emitTypingStart,
+  emitTypingStop,
+  markRoomRead,
+} from '../utils/socket.js';
+import {
   deriveSharedKey,
   encryptMessage,
   decryptMessage,
-  encryptFile,
-} from '../utils/crypto';
+  decryptFile,
+} from '../utils/crypto.js';
+import { useAuth } from '../context/AuthContext.jsx';
 
-const SOCKET_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:4000';
+const TYPING_DEBOUNCE_MS = 300;
 
-// ──────────────────────────────────────────────
-// useChat hook
-// ──────────────────────────────────────────────
-export function useChat({ token, userId, roomId }) {
-  const socketRef = useRef(null);
-  const [connected, setConnected] = useState(false);
-  const [messages, setMessages] = useState([]);
-  const [typingUsers, setTypingUsers] = useState([]);
-  const [onlineUsers, setOnlineUsers] = useState({});
-  const [error, setError] = useState(null);
+export function useChat(roomId) {
+  const { user } = useAuth();
 
-  // Shared key cache: recipientId → CryptoKey
-  const sharedKeyCache = useRef(new Map());
-  const typingTimerRef = useRef(null);
+  const [room,       setRoom]       = useState(null);
+  const [messages,   setMessages]   = useState([]);
+  const [members,    setMembers]    = useState([]);
+  const [typing,     setTyping]     = useState({}); // { userId: username }
+  const [presence,   setPresence]   = useState({}); // { userId: 'online'|'away'|'offline' }
+  const [loading,    setLoading]    = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore,    setHasMore]    = useState(true);
+  const [error,      setError]      = useState(null);
 
-  // ── Connect on mount ───────────────────────────
-  useEffect(() => {
-    const socket = io(SOCKET_URL, {
-      auth: { token },
-      transports: ['websocket'],
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 30000,
-    });
+  // Shared key cache: { userId → CryptoKey }
+  // Avoids running ECDH on every incoming message from the same sender.
+  const sharedKeyCache = useRef({});
 
-    socketRef.current = socket;
+  // Typing debounce timer ref
+  const typingTimer = useRef(null);
+  // Track whether we're currently "typing" to avoid redundant emits
+  const isTyping = useRef(false);
 
-    socket.on('connect', () => {
-      setConnected(true);
-      setError(null);
-    });
+  // ── Shared key helper ─────────────────────────────────────────────────────
 
-    socket.on('disconnect', (reason) => {
-      setConnected(false);
-      if (reason === 'io server disconnect') {
-        // Server forced disconnect — don't auto-reconnect
-        setError('Disconnected by server');
-      }
-    });
-
-    socket.on('connect_error', (err) => {
-      setError(`Connection error: ${err.message}`);
-    });
-
-    // Presence updates
-    socket.on('presence:update', ({ userId: uid, status }) => {
-      setOnlineUsers((prev) => ({ ...prev, [uid]: status }));
-    });
-
-    // Typing indicators
-    socket.on('typing:update', ({ userId: uid, username, roomId: rid, isTyping }) => {
-      if (rid !== roomId) return;
-      setTypingUsers((prev) =>
-        isTyping
-          ? prev.includes(username) ? prev : [...prev, username]
-          : prev.filter((u) => u !== username)
-      );
-    });
-
-    // Reactions
-    socket.on('reaction:update', ({ messageId, reactions }) => {
-      setMessages((prev) =>
-        prev.map((m) => m._id === messageId ? { ...m, reactions } : m)
-      );
-    });
-
-    // Read receipts
-    socket.on('receipts:update', ({ userId: uid, lastReadMessageId }) => {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m._id <= lastReadMessageId
-            ? { ...m, readBy: [...(m.readBy || []), uid] }
-            : m
-        )
-      );
-    });
-
-    return () => {
-      socket.disconnect();
-    };
-  }, [token]);
-
-  // ── Join/leave room ────────────────────────────
-  useEffect(() => {
-    const socket = socketRef.current;
-    if (!socket || !roomId) return;
-
-    setMessages([]);
-    setTypingUsers([]);
-    socket.emit('room:join', { roomId });
-
-    // Receive history
-    socket.on('room:history', async (history) => {
-      const decrypted = await Promise.all(history.map(decryptIncoming));
-      setMessages(decrypted);
-    });
-
-    // Real-time new message
-    socket.on('message:new', async (msg) => {
-      const decrypted = await decryptIncoming(msg);
-      setMessages((prev) => [...prev, decrypted]);
-    });
-
-    return () => {
-      socket.emit('room:leave', { roomId });
-      socket.off('room:history');
-      socket.off('message:new');
-    };
-  }, [roomId]);
-
-  // ── Decrypt incoming message ───────────────────
-  const decryptIncoming = useCallback(async (msg) => {
-    try {
-      const key = await getSharedKey(msg.sender._id);
-      const plaintext = await decryptMessage(msg.encryptedContent, msg.iv, key);
-      return { ...msg, content: plaintext, decrypted: true };
-    } catch {
-      return { ...msg, content: '[Unable to decrypt]', decrypted: false };
+  const getSharedKey = useCallback(async (senderId, senderPublicKey) => {
+    if (sharedKeyCache.current[senderId]) {
+      return sharedKeyCache.current[senderId];
     }
+    if (!senderPublicKey) {
+      throw new Error(`No public key available for user ${senderId}`);
+    }
+    const key = await deriveSharedKey(senderPublicKey);
+    sharedKeyCache.current[senderId] = key;
+    return key;
   }, []);
 
-  // ── Get or derive shared key ───────────────────
-  async function getSharedKey(recipientId) {
-    if (sharedKeyCache.current.has(recipientId)) {
-      return sharedKeyCache.current.get(recipientId);
+  // ── Decrypt a raw message from the server ─────────────────────────────────
+
+  const decryptIncomingMessage = useCallback(async (msg) => {
+    try {
+      const sharedKey = await getSharedKey(msg.sender.id, msg.sender.publicKey);
+      const plaintext = await decryptMessage(msg.content, sharedKey);
+      return { ...msg, plaintext, decryptError: null };
+    } catch (err) {
+      // Decryption failure is non-fatal — show a placeholder
+      return { ...msg, plaintext: null, decryptError: err.message };
+    }
+  }, [getSharedKey]);
+
+  // ── Load room + history via GraphQL ───────────────────────────────────────
+
+  const loadRoom = useCallback(async () => {
+    if (!roomId) return;
+    setLoading(true);
+    setError(null);
+
+    try {
+      const data = await gql(QUERIES.ROOM, { id: roomId, limit: 20 });
+      const r    = data.room;
+
+      setRoom(r);
+      setMembers(r.members);
+
+      // Seed presence map from current member list
+      const presenceMap = {};
+      r.members.forEach((m) => { presenceMap[m.id] = m.presence; });
+      setPresence(presenceMap);
+
+      // Decrypt all history messages
+      const decrypted = await Promise.all(r.messages.map(decryptIncomingMessage));
+      setMessages(decrypted);
+      setHasMore(r.messages.length === 20);
+
+      // Join the Socket.io room (server validates membership again)
+      await joinRoom(roomId);
+      markRoomRead(roomId);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [roomId, decryptIncomingMessage]);
+
+  // ── Load older messages (pagination) ─────────────────────────────────────
+
+  const loadMoreMessages = useCallback(async () => {
+    if (!roomId || !hasMore || loadingMore || messages.length === 0) return;
+    setLoadingMore(true);
+
+    try {
+      const oldest = messages[0];
+      const data   = await gql(QUERIES.ROOM, {
+        id:     roomId,
+        limit:  20,
+        before: oldest.createdAt,
+      });
+      const older = data.room.messages;
+
+      if (older.length === 0) {
+        setHasMore(false);
+        return;
+      }
+
+      const decrypted = await Promise.all(older.map(decryptIncomingMessage));
+      setMessages((prev) => [...decrypted, ...prev]);
+      setHasMore(older.length === 20);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [roomId, hasMore, loadingMore, messages, decryptIncomingMessage]);
+
+  // ── Send a message ────────────────────────────────────────────────────────
+
+  /**
+   * Encrypts and sends a plaintext message to the current room.
+   * Stops any in-progress typing indicator.
+   *
+   * @param {string}      plaintext
+   * @param {string|null} [fileId] - Optional file attachment ObjectId
+   */
+  const sendMessage = useCallback(async (plaintext, fileId = null) => {
+    if (!roomId || !user) throw new Error('No active room or user.');
+
+    // Stop typing indicator immediately on send
+    stopTyping();
+
+    // Find recipient's public key — for DMs this is the other member,
+    // for group chats we encrypt for each member (simplified: use own key here
+    // as a placeholder — full group key distribution is a future concern).
+    // For now, find the first member who is not the sender.
+    const recipient = members.find((m) => m.id !== user.id) ?? members[0];
+    if (!recipient) throw new Error('No recipient found in room.');
+
+    const sharedKey  = await getSharedKey(recipient.id, recipient.publicKey);
+    const ciphertext = await encryptMessage(plaintext, sharedKey);
+
+    await socketSendMessage({ roomId, content: ciphertext, fileId });
+  }, [roomId, user, members, getSharedKey]);
+
+  // ── Typing indicators ─────────────────────────────────────────────────────
+
+  const startTyping = useCallback(() => {
+    if (!roomId) return;
+
+    if (!isTyping.current) {
+      isTyping.current = true;
+      emitTypingStart(roomId);
     }
 
-    // Fetch recipient's public key from server
-    const res = await fetch(`/api/users/${recipientId}/public-key`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const { publicKeyJwk } = await res.json();
-
-    const myPrivateKeyJwk = await loadPrivateKey();
-    const sharedKey = await deriveSharedKey(myPrivateKeyJwk, publicKeyJwk);
-    sharedKeyCache.current.set(recipientId, sharedKey);
-    return sharedKey;
-  }
-
-  // ── Send a text message ────────────────────────
-  const sendMessage = useCallback(async (text, recipientId) => {
-    const socket = socketRef.current;
-    if (!socket || !roomId) return;
-
-    const tempId = `temp-${Date.now()}`;
-    const sharedKey = await getSharedKey(recipientId || userId);
-
-    const { encryptedContent, iv } = await encryptMessage(text, sharedKey);
-
-    // Optimistic update
-    setMessages((prev) => [
-      ...prev,
-      {
-        _id: tempId,
-        roomId,
-        sender: { _id: userId },
-        content: text,
-        encryptedContent,
-        iv,
-        type: 'text',
-        createdAt: new Date().toISOString(),
-        status: 'sending',
-      },
-    ]);
-
-    socket.emit('message:send', {
-      tempId,
-      roomId,
-      encryptedContent,
-      iv,
-      type: 'text',
-    });
-
-    // Replace temp message with server-confirmed one
-    socket.once('message:ack', ({ tempId: tid, messageId }) => {
-      setMessages((prev) =>
-        prev.map((m) => m._id === tid ? { ...m, _id: messageId, status: 'sent' } : m)
-      );
-    });
-  }, [roomId, userId, token]);
-
-  // ── Send a file ─────────────────────────────────
-  const sendFile = useCallback(async (file, recipientId) => {
-    const socket = socketRef.current;
-    if (!socket || !roomId) return;
-
-    const sharedKey = await getSharedKey(recipientId || userId);
-    const fileBuffer = await file.arrayBuffer();
-
-    const { encryptedFile, encryptedFileKey, iv, fileKeyIv } =
-      await encryptFile(fileBuffer, sharedKey);
-
-    // Upload encrypted file to server
-    const formData = new FormData();
-    formData.append('file', new Blob([encryptedFile]), file.name);
-    formData.append('encryptedFileKey', encryptedFileKey);
-    formData.append('iv', iv);
-    formData.append('fileKeyIv', fileKeyIv);
-
-    const res = await fetch('/api/files/upload', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: formData,
-    });
-    const { fileId, url } = await res.json();
-
-    // Send file message
-    const { encryptedContent, iv: msgIv } = await encryptMessage(
-      JSON.stringify({ fileId, url, name: file.name, size: file.size, type: file.type }),
-      sharedKey
-    );
-
-    socket.emit('message:send', {
-      roomId,
-      encryptedContent,
-      iv: msgIv,
-      type: 'file',
-      fileMetadata: {
-        fileId,
-        name: file.name,
-        size: file.size,
-        mimeType: file.type,
-        encryptedFileKey,
-        fileKeyIv,
-      },
-    });
-  }, [roomId, userId, token]);
-
-  // ── Typing indicator ───────────────────────────
-  const startTyping = useCallback(() => {
-    const socket = socketRef.current;
-    if (!socket) return;
-    socket.emit('typing:start', { roomId });
-    clearTimeout(typingTimerRef.current);
-    typingTimerRef.current = setTimeout(() => stopTyping(), 3000);
+    // Debounce: auto-stop after TYPING_DEBOUNCE_MS of silence
+    clearTimeout(typingTimer.current);
+    typingTimer.current = setTimeout(() => {
+      stopTyping();
+    }, TYPING_DEBOUNCE_MS);
   }, [roomId]);
 
   const stopTyping = useCallback(() => {
-    const socket = socketRef.current;
-    if (!socket) return;
-    socket.emit('typing:stop', { roomId });
-    clearTimeout(typingTimerRef.current);
+    clearTimeout(typingTimer.current);
+    if (isTyping.current) {
+      isTyping.current = false;
+      if (roomId) emitTypingStop(roomId);
+    }
   }, [roomId]);
 
-  // ── Add reaction ───────────────────────────────
-  const addReaction = useCallback((messageId, emoji) => {
-    socketRef.current?.emit('reaction:add', { messageId, emoji });
-  }, []);
+  // ── Socket event listeners ────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!roomId) return;
+
+    const socket = getSocket();
+
+    // ── message:new ─────────────────────────────────────────────────────────
+    const onMessage = async (msg) => {
+      if (msg.roomId !== roomId) return;
+      const decrypted = await decryptIncomingMessage(msg);
+      setMessages((prev) => {
+        // Deduplicate in case server echoes back our own optimistic message
+        if (prev.some((m) => m.id === decrypted.id)) return prev;
+        return [...prev, decrypted];
+      });
+      markRoomRead(roomId);
+    };
+
+    // ── typing:update ────────────────────────────────────────────────────────
+    const onTyping = ({ userId, username, roomId: rid, isTyping: active }) => {
+      if (rid !== roomId || userId === user?.id) return;
+      setTyping((prev) => {
+        if (active) return { ...prev, [userId]: username };
+        const next = { ...prev };
+        delete next[userId];
+        return next;
+      });
+    };
+
+    // ── presence:update ──────────────────────────────────────────────────────
+    const onPresence = ({ userId, presence: p }) => {
+      setPresence((prev) => ({ ...prev, [userId]: p }));
+      // Mirror into members list
+      setMembers((prev) =>
+        prev.map((m) => m.id === userId ? { ...m, presence: p } : m)
+      );
+    };
+
+    // ── read:update ──────────────────────────────────────────────────────────
+    const onRead = ({ userId, roomId: rid }) => {
+      if (rid !== roomId) return;
+      setMessages((prev) =>
+        prev.map((m) => ({
+          ...m,
+          readBy: m.readBy?.some((r) => r.id === userId)
+            ? m.readBy
+            : [...(m.readBy ?? []), { id: userId }],
+        }))
+      );
+    };
+
+    socket.on('message:new',    onMessage);
+    socket.on('typing:update',  onTyping);
+    socket.on('presence:update', onPresence);
+    socket.on('read:update',    onRead);
+
+    return () => {
+      socket.off('message:new',    onMessage);
+      socket.off('typing:update',  onTyping);
+      socket.off('presence:update', onPresence);
+      socket.off('read:update',    onRead);
+    };
+  }, [roomId, user?.id, decryptIncomingMessage]);
+
+  // ── Room join/leave lifecycle ─────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!roomId) return;
+
+    // Clear previous room state
+    setMessages([]);
+    setTyping({});
+    setHasMore(true);
+    sharedKeyCache.current = {};
+
+    loadRoom();
+
+    return () => {
+      stopTyping();
+      if (roomId) leaveRoom(roomId);
+    };
+  }, [roomId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── File download helper ──────────────────────────────────────────────────
+
+  /**
+   * Downloads and decrypts a file attachment, then triggers browser download.
+   *
+   * @param {{ id, encryptedFileKey, originalName, mimeType, sender }} fileDoc
+   */
+  const downloadFile = useCallback(async (fileDoc) => {
+    try {
+      const { url, encryptedFileKey, originalName, mimeType } =
+        await getFileDownloadUrl(fileDoc.id);
+
+      const response       = await fetch(url);
+      const encryptedBuffer = await response.arrayBuffer();
+
+      const sharedKey    = await getSharedKey(fileDoc.sender.id, fileDoc.sender.publicKey);
+      const decryptedBlob = await decryptFile(encryptedBuffer, encryptedFileKey, sharedKey, mimeType);
+
+      // Trigger browser download
+      const objectUrl = URL.createObjectURL(decryptedBlob);
+      const a         = document.createElement('a');
+      a.href          = objectUrl;
+      a.download      = originalName;
+      a.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      console.error('[useChat] file download failed:', err);
+      throw err;
+    }
+  }, [getSharedKey]);
 
   return {
-    connected,
+    room,
     messages,
-    typingUsers,
-    onlineUsers,
+    members,
+    typing,       // { [userId]: username } — users currently typing
+    presence,     // { [userId]: 'online'|'away'|'offline' }
+    loading,
+    loadingMore,
+    hasMore,
     error,
     sendMessage,
-    sendFile,
     startTyping,
     stopTyping,
-    addReaction,
+    loadMoreMessages,
+    downloadFile,
   };
 }
