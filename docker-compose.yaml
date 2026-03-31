@@ -1,0 +1,46 @@
+version: '3.9'
+ 
+services:
+  mongo:
+    image: mongo:6
+    command: --replSet rs0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+ 
+  mongo-init:
+    image: mongo:6
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command: >
+      mongosh --host mongo:27017 --eval
+      "try { rs.status() } catch(e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }) }"
+    restart: "no"
+ 
+  server:
+    build: ./server
+    ports:
+      - "4000:4000"
+    env_file: ./server/.env
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017/nexchat?replicaSet=rs0
+    depends_on:
+      - mongo-init
+ 
+  client:
+    build: ./client
+    ports:
+      - "3000:3000"
+    env_file: ./client/.env
+    depends_on:
+      - server
+ 
+volumes:
+  mongo_data:
