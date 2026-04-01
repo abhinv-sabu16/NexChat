@@ -129,6 +129,19 @@ export async function refreshAccessToken() {
 /**
  * POST /api/auth/logout
  */
+/**
+ * PUT /api/auth/publicKey
+ * Uploads the ECDH public key for the authenticated user.
+ * Called after login when the server record has publicKey: null.
+ */
+export async function uploadPublicKey(publicKey) {
+  await apiFetch(`${BASE_URL}/api/auth/publicKey`, {
+    method:  'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ publicKey }),
+  });
+}
+
 export async function logout() {
   await apiFetch(`${BASE_URL}/api/auth/logout`, { method: 'POST' });
   clearAccessToken();
