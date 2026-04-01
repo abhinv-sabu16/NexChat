@@ -1,20 +1,5 @@
 /**
  * server/index.js
- *
- * Application entry point — pure orchestration, nothing else.
- *
- * Each concern lives in its own module:
- *   Database     → config/db.js
- *   Apollo/GQL   → config/apollo.js
- *   Auth/JWT     → middleware/auth.js
- *   REST routes  → rest/*.routes.js
- *   Sockets      → sockets/chat.socket.js
- *   Errors       → middleware/errorHandler.js
- *
- * Three-layer architecture on one port:
- *   REST      →  /api/*
- *   GraphQL   →  /graphql
- *   Socket.io →  ws://  (same HTTP server, upgraded connection)
  */
 
 import 'dotenv/config';
@@ -34,40 +19,45 @@ import { fileRouter }           from './rest/file.routes.js';
 import { registerChatSocket }   from './sockets/chat.socket.js';
 import { errorHandler }         from './middleware/errorHandler.js';
 
-const PORT   = process.env.PORT ?? 4000;
+const PORT    = process.env.PORT ?? 4000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 // ─── 1. Express ───────────────────────────────────────────────────────────────
 
 const app = express();
 
+// ── Trust proxy ───────────────────────────────────────────────────────────────
+// Render sits behind a reverse proxy that injects X-Forwarded-For.
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// on every request. Apollo catches it and returns INTERNAL_SERVER_ERROR,
+// which broke the `me` query and prevented auto-login on page reload.
+// '1' = trust exactly one proxy hop (Render's load balancer).
+app.set('trust proxy', 1);
+
 app.use(helmet({
-  // Relax CSP in development so Apollo Sandbox can load
   contentSecurityPolicy: IS_PROD,
 }));
 
 const ALLOWED_ORIGINS = new Set([
-  process.env.CLIENT_URL,          // https://nex-chat-coral.vercel.app
-  'http://localhost:5173',         // Vite dev server
-  'http://localhost:3000',         // fallback
+  process.env.CLIENT_URL,
+  'http://localhost:5173',
+  'http://localhost:3000',
 ].filter(Boolean));
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (curl, Postman, server-to-server)
     if (!origin || ALLOWED_ORIGINS.has(origin)) {
       callback(null, true);
     } else {
       callback(new Error(`CORS: origin ${origin} not allowed`));
     }
   },
-  credentials: true, // Required for refresh-token cookie
+  credentials: true,
 }));
 
 app.use(cookieParser());
 app.use(express.json({ limit: '1mb' }));
 
-// Global rate limit — auth routes have their own stricter limiter on top
 app.use(rateLimit({
   windowMs:        60 * 1_000,
   max:             300,
@@ -97,21 +87,17 @@ const io = new SocketIOServer(httpServer, {
 registerChatSocket(io);
 
 // ─── 4. Apollo / GraphQL ──────────────────────────────────────────────────────
-// Apollo must be started before registering the Express middleware.
 
 const apollo = await createApolloServer(httpServer);
 
 app.use(
   '/graphql',
   expressMiddleware(apollo, {
-    // Injects { user } into GraphQL context on every request.
-    // Resolvers call requireAuth(ctx) per-field — not enforced globally here.
     context: buildApolloContext,
   })
 );
 
 // ─── 5. Central error handler ─────────────────────────────────────────────────
-// Must be registered AFTER all routes.
 
 app.use(errorHandler);
 
