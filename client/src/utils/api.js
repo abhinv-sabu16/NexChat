@@ -246,4 +246,37 @@ export const QUERIES = {
       user(id: $id) { id username publicKey presence }
     }
   `,
+  SEARCH_USERS: /* GraphQL */ `
+    query SearchUsers($query: String!) {
+      searchUsers(query: $query) { id username publicKey presence }
+    }
+  `,
+};
+
+// ─── GraphQL mutations ────────────────────────────────────────────────────────
+
+export const MUTATIONS = {
+  CREATE_ROOM: /* GraphQL */ `
+    mutation CreateRoom($name: String!, $description: String, $type: RoomType) {
+      createRoom(name: $name, description: $description, type: $type) {
+        id name description type createdAt
+        members { id username publicKey presence }
+        createdBy { id username }
+      }
+    }
+  `,
+
+  ADD_MEMBER: /* GraphQL */ `
+    mutation AddMember($roomId: ID!, $userId: ID!) {
+      addMember(roomId: $roomId, userId: $userId) {
+        id members { id username publicKey presence }
+      }
+    }
+  `,
+
+  LEAVE_ROOM: /* GraphQL */ `
+    mutation LeaveRoom($roomId: ID!) {
+      leaveRoom(roomId: $roomId)
+    }
+  `,
 };
