@@ -1,53 +1,35 @@
 /**
  * services/roomService.js
- *
- * All room-related database operations.
- *
- * Consumers: GraphQL resolvers, Socket.io handlers, file routes.
- * No Room model imports outside this file.
  */
 
 import Room from '../models/Room.js';
-import { NotFoundError, ForbiddenError } from '../lib/errors.js';
+import User from '../models/User.js';
+import { NotFoundError, ForbiddenError, ConflictError } from '../lib/errors.js';
 import { POPULATE } from '../lib/constants.js';
+
+// ─── Shared populate helper ───────────────────────────────────────────────────
+
+function populateRoom(query) {
+  return query
+    .populate('members',   POPULATE.USER_PUBLIC)
+    .populate('createdBy', POPULATE.USER_CREATED);
+}
 
 // ─── Queries ──────────────────────────────────────────────────────────────────
 
-/**
- * Returns all rooms visible to a user:
- *   - All public rooms
- *   - Private rooms where the user is a member
- *
- * @param {string} userId
- * @returns {Promise<object[]>}
- */
 export async function getRoomsForUser(userId) {
-  return Room.find({
-    $or: [
-      { type: 'public' },
-      { type: 'private', members: userId },
-    ],
-  })
-    .populate('members',   POPULATE.USER_PUBLIC)
-    .populate('createdBy', POPULATE.USER_CREATED)
-    .lean();
+  return populateRoom(
+    Room.find({
+      $or: [
+        { type: 'public' },
+        { type: 'private', members: userId },
+      ],
+    })
+  ).lean();
 }
 
-/**
- * Returns a single room by ID, with members and creator populated.
- * Enforces membership check for private rooms.
- *
- * @param {string} roomId
- * @param {string} requestingUserId - Used for private room access check
- * @returns {Promise<object>} Lean room document
- * @throws {NotFoundError}  If room does not exist
- * @throws {ForbiddenError} If room is private and user is not a member
- */
 export async function getRoomById(roomId, requestingUserId) {
-  const room = await Room.findById(roomId)
-    .populate('members',   POPULATE.USER_PUBLIC)
-    .populate('createdBy', POPULATE.USER_CREATED)
-    .lean();
+  const room = await populateRoom(Room.findById(roomId)).lean();
 
   if (!room) throw new NotFoundError('Room');
 
@@ -61,21 +43,6 @@ export async function getRoomById(roomId, requestingUserId) {
   return room;
 }
 
-// ─── Membership guard ─────────────────────────────────────────────────────────
-
-/**
- * Verifies that a user is a member of a room.
- * Used by Socket.io handlers and file routes before any action is taken.
- *
- * Returns the lean room document on success so callers can avoid a
- * second query if they need the room data.
- *
- * @param {string} roomId
- * @param {string} userId
- * @returns {Promise<object>} Lean room document
- * @throws {NotFoundError}  If room does not exist
- * @throws {ForbiddenError} If user is not a member
- */
 export async function assertMembership(roomId, userId) {
   const room = await Room.findById(roomId).lean();
   if (!room) throw new NotFoundError('Room');
@@ -86,4 +53,99 @@ export async function assertMembership(roomId, userId) {
   if (!isMember) throw new ForbiddenError('You are not a member of this room.');
 
   return room;
+}
+
+// ─── Mutations ────────────────────────────────────────────────────────────────
+
+/**
+ * Create a new room. Creator is automatically added as first member.
+ */
+export async function createRoom({ name, description = '', type = 'public' }, creatorId) {
+  const trimmed = name?.trim();
+  if (!trimmed) throw new Error('Room name is required.');
+  if (trimmed.length > 64) throw new Error('Room name must be 64 characters or fewer.');
+
+  const room = await Room.create({
+    name:      trimmed,
+    description,
+    type,
+    members:   [creatorId],
+    createdBy: creatorId,
+  });
+
+  return populateRoom(Room.findById(room._id)).lean();
+}
+
+/**
+ * Add a member to a room. Requester must already be a member.
+ */
+export async function addMember(roomId, userId, requestingUserId) {
+  const room = await Room.findById(roomId);
+  if (!room) throw new NotFoundError('Room');
+
+  const requesterIsMember = room.members.some(
+    (m) => m.toString() === requestingUserId.toString()
+  );
+  if (!requesterIsMember) throw new ForbiddenError('Only room members can add others.');
+
+  const userExists = await User.findById(userId).lean();
+  if (!userExists) throw new NotFoundError('User');
+
+  const alreadyMember = room.members.some(
+    (m) => m.toString() === userId.toString()
+  );
+  if (alreadyMember) throw new ConflictError('User is already a member of this room.');
+
+  room.members.push(userId);
+  await room.save();
+
+  return populateRoom(Room.findById(roomId)).lean();
+}
+
+/**
+ * Remove a member from a room. Requester must be a member.
+ */
+export async function removeMember(roomId, userId, requestingUserId) {
+  const room = await Room.findById(roomId);
+  if (!room) throw new NotFoundError('Room');
+
+  const requesterIsMember = room.members.some(
+    (m) => m.toString() === requestingUserId.toString()
+  );
+  if (!requesterIsMember) throw new ForbiddenError('You are not a member of this room.');
+
+  room.members = room.members.filter(
+    (m) => m.toString() !== userId.toString()
+  );
+  await room.save();
+
+  return populateRoom(Room.findById(roomId)).lean();
+}
+
+/**
+ * User leaves a room (removes themselves).
+ */
+export async function leaveRoom(roomId, userId) {
+  const room = await Room.findById(roomId);
+  if (!room) throw new NotFoundError('Room');
+
+  room.members = room.members.filter(
+    (m) => m.toString() !== userId.toString()
+  );
+  await room.save();
+  return true;
+}
+
+/**
+ * Search users by username prefix (case-insensitive). Excludes the requester.
+ */
+export async function searchUsers(query, excludeUserId) {
+  if (!query?.trim()) return [];
+  return User.find({
+    username: { $regex: `^${query.trim()}`, $options: 'i' },
+    _id:      { $ne: excludeUserId },
+  })
+    .select(POPULATE.USER_PUBLIC)
+    .limit(10)
+    .lean();
 }
