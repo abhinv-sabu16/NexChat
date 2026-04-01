@@ -1,13 +1,5 @@
 /**
  * config/apollo.js
- *
- * Apollo Server 4 setup.
- * Extracted from index.js so the entry point is pure orchestration.
- *
- * Responsibilities:
- *   - Build executable schema from typeDefs + merged resolvers
- *   - Configure Apollo plugins (graceful drain, landing page)
- *   - Export context builder (buildApolloContext) for expressMiddleware
  */
 
 import { ApolloServer }                          from '@apollo/server';
@@ -19,40 +11,29 @@ import { makeExecutableSchema }                  from '@graphql-tools/schema';
 import { typeDefs  } from '../graphql/schema.js';
 import { resolvers } from '../graphql/resolvers/index.js';
 
-// Re-export so index.js only needs to import from config/apollo
 export { buildApolloContext } from '../middleware/auth.js';
 
 const IS_PROD = process.env.NODE_ENV === 'production';
 
-/**
- * Creates and starts the Apollo Server instance.
- *
- * @param {import('http').Server} httpServer - The shared HTTP server.
- *   Passed to ApolloServerPluginDrainHttpServer for graceful shutdown.
- * @returns {Promise<ApolloServer>} Started Apollo instance
- */
 export async function createApolloServer(httpServer) {
   const schema = makeExecutableSchema({ typeDefs, resolvers });
 
   const server = new ApolloServer({
     schema,
     plugins: [
-      // Drains the HTTP server before Apollo shuts down — prevents dropped requests
       ApolloServerPluginDrainHttpServer({ httpServer }),
-
-      // Show Apollo Sandbox in development; disable entirely in production
       IS_PROD
         ? ApolloServerPluginLandingPageDisabled()
         : ApolloServerPluginLandingPageLocalDefault({ footer: false }),
     ],
-    // Introspection: on in dev, off in prod (prevents schema leaking)
     introspection: !IS_PROD,
 
-    // Format errors before sending to client — strip internal details in prod
-    // eslint-disable-next-line no-unused-vars
-    formatError(formattedError, _error) {
+    formatError(formattedError, error) {
+      // Log the REAL error to Render logs — this is what formatError was hiding
+      console.error('[graphql] error:', error?.message);
+      console.error('[graphql] stack:', error?.stack);
+
       if (IS_PROD) {
-        // Never leak stack traces or internal error messages to clients
         const safeMessage =
           formattedError.extensions?.code === 'INTERNAL_SERVER_ERROR'
             ? 'An internal error occurred.'
