@@ -16,8 +16,12 @@ import { assertMembership } from './roomService.js';
 // Defined once here; both createMessage and getMessages use the same shape.
 
 const MESSAGE_POPULATE = [
-  { path: 'sender', select: POPULATE.USER_PUBLIC },
-  { path: 'file',   select: POPULATE.FILE_META   },
+  { path: 'sender', select: POPULATE.USER_PUBLIC  },
+  { path: 'file',   select: POPULATE.FILE_META    },
+  // 'room' is populated so the GraphQL Room field resolver has a proper object.
+  // 'readBy' is populated so User field resolvers can resolve id correctly.
+  { path: 'room',   select: 'id name type'        },
+  { path: 'readBy', select: 'id username'         },
 ];
 
 // ─── createMessage ────────────────────────────────────────────────────────────

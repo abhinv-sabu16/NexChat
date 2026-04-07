@@ -86,8 +86,14 @@ export const FileUploadSchema = z.object({
 // ─── GraphQL argument schemas ─────────────────────────────────────────────────
 
 export const RoomMessagesArgsSchema = z.object({
-  limit:  z.number().int().min(1).max(100).optional().default(20),
-  before: z.string().datetime({ message: 'before must be a valid ISO 8601 date-time' }).optional().nullable(),
+  // GraphQL passes Int which arrives as a JS number; coerce to be safe
+  limit: z.coerce.number().int().min(1).max(100).optional().default(20),
+  // before is an ISO string from createdAt.toISOString() — allow null/undefined
+  before: z
+    .string()
+    .datetime({ offset: true, message: 'before must be a valid ISO 8601 date-time' })
+    .optional()
+    .nullable(),
 });
 
 export const IdArgSchema = z.object({

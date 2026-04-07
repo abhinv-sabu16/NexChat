@@ -1,17 +1,15 @@
 /**
  * graphql/schema.js
+ *
+ * All GraphQL type definitions.
+ * Auth and file uploads are intentionally absent — they are REST-only.
  */
 
 export const typeDefs = /* GraphQL */ `
 
   scalar DateTime
 
-  type User {
-    id:        ID!
-    username:  String!
-    publicKey: String
-    presence:  Presence!
-  }
+  # ── Enums ────────────────────────────────────────────────────────────────────
 
   enum Presence {
     online
@@ -19,11 +17,30 @@ export const typeDefs = /* GraphQL */ `
     offline
   }
 
-  type Message {
+  enum RoomType {
+    public
+    private
+  }
+
+  # ── Types ────────────────────────────────────────────────────────────────────
+
+  type User {
     id:        ID!
+    username:  String!
+    """ECDH P-256 public key (base64). Null until key pair is generated client-side."""
+    publicKey: String
+    presence:  Presence!
+  }
+
+  type Message {
+    id:      ID!
+    """
+    AES-256-GCM ciphertext in "iv:ciphertext" base64 format.
+    The server stores and relays this opaque value — it cannot decrypt it.
+    """
     content:   String!
     sender:    User!
-    room:      Room!
+    room:      Room
     file:      File
     readBy:    [User!]!
     createdAt: DateTime!
@@ -35,51 +52,41 @@ export const typeDefs = /* GraphQL */ `
     description: String
     type:        RoomType!
     members:     [User!]!
-    messages(limit: Int, before: String): [Message!]!
+    messages(
+      """Number of messages to return. Default: 20. Max: 100."""
+      limit: Int
+      """Cursor-based pagination: return messages older than this ISO date."""
+      before: String
+    ): [Message!]!
     createdBy:   User!
     createdAt:   DateTime!
   }
 
-  enum RoomType {
-    public
-    private
-  }
-
   type File {
-    id:               ID!
-    originalName:     String!
-    mimeType:         String!
-    sizeBytes:        Int!
-    s3Key:            String!
+    id:           ID!
+    originalName: String!
+    mimeType:     String!
+    sizeBytes:    Int!
+    s3Key:        String!
+    """Per-file AES-256 key encrypted with the ECDH shared key."""
     encryptedFileKey: String!
-    uploadedBy:       User!
-    createdAt:        DateTime!
+    uploadedBy:   User!
+    createdAt:    DateTime!
   }
 
   # ── Queries ───────────────────────────────────────────────────────────────────
 
   type Query {
+    """All public rooms, plus private rooms the caller belongs to."""
     rooms: [Room!]!
+
+    """Single room by ID. Private rooms require membership."""
     room(id: ID!): Room
+
+    """Fetch a user by ID. Primary use: retrieve publicKey for ECDH key agreement."""
     user(id: ID!): User
+
+    """The currently authenticated user."""
     me: User
-    """Search users by username prefix — for the Add Member picker."""
-    searchUsers(query: String!): [User!]!
-  }
-
-  # ── Mutations ─────────────────────────────────────────────────────────────────
-
-  type Mutation {
-    """Create a new room. Creator is automatically added as the first member."""
-    createRoom(name: String!, description: String, type: RoomType): Room!
-
-    """Add a member to a room. Only existing members can invite."""
-    addMember(roomId: ID!, userId: ID!): Room!
-
-    """Remove a member from a room."""
-    removeMember(roomId: ID!, userId: ID!): Room!
-
-    """Leave a room (removes self)."""
-    leaveRoom(roomId: ID!): Boolean!
   }
 `;

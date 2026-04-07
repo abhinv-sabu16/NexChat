@@ -60,10 +60,15 @@ export const messageResolvers = {
 
     // Populated by messageService — pass through directly
     sender:    (p) => p.sender,
-    room:      (p) => p.room,
+    // room may be null when message is fetched through a Room (parent already known)
+    room:      (p) => p.room ?? null,
     file:      (p) => p.file   ?? null,
     readBy:    (p) => p.readBy ?? [],
   },
+
+  // Room field resolver on Message — needed because room is now populated
+  // and _id must be normalised to string id for GraphQL
+  // (reuses the same shape as roomResolver.Room.id)
 
   File: {
     id:         (p) => (p._id ?? p.id).toString(),
