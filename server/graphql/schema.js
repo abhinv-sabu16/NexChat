@@ -86,7 +86,24 @@ export const typeDefs = /* GraphQL */ `
     """Fetch a user by ID. Primary use: retrieve publicKey for ECDH key agreement."""
     user(id: ID!): User
 
+    """Search for users by username. Matches start of string, case-insensitive."""
+    searchUsers(query: String!): [User!]!
+
     """The currently authenticated user."""
     me: User
+  }
+
+  type Mutation {
+    """Create a new room. Defaults to public if not specified."""
+    createRoom(name: String!, description: String, type: RoomType!): Room!
+
+    """Add a user to a room. Requires admin (creator) privileges."""
+    addMember(roomId: ID!, userId: ID!): Room!
+
+    """Remove a user from a room. Requires admin (creator) privileges."""
+    removeMember(roomId: ID!, userId: ID!): Room!
+
+    """Leave a room."""
+    leaveRoom(roomId: ID!): Room!
   }
 `;
