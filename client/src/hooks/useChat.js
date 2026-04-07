@@ -79,14 +79,29 @@ export function useChat(roomId) {
 
   const decryptIncomingMessage = useCallback(async (msg) => {
     try {
-      const sharedKey = await getSharedKey(msg.sender.id, msg.sender.publicKey);
+      const isOwn = msg.sender.id === user?.id;
+      let peerId, peerPubKey;
+
+      if (isOwn) {
+        // If we sent it, we must derive using the same key we used to encrypt it (the recipient's)
+        const recipient = members.find((m) => m.id !== user.id) ?? members[0];
+        if (!recipient) throw new Error('No recipient found');
+        peerId = recipient.id;
+        peerPubKey = recipient.publicKey;
+      } else {
+        // If they sent it, we derive using their key
+        peerId = msg.sender.id;
+        peerPubKey = msg.sender.publicKey;
+      }
+
+      const sharedKey = await getSharedKey(peerId, peerPubKey);
       const plaintext = await decryptMessage(msg.content, sharedKey);
       return { ...msg, plaintext, decryptError: null };
     } catch (err) {
       // Decryption failure is non-fatal — show a placeholder
       return { ...msg, plaintext: null, decryptError: err.message };
     }
-  }, [getSharedKey]);
+  }, [getSharedKey, user, members]);
 
   // ── Load room + history via GraphQL ───────────────────────────────────────
 
