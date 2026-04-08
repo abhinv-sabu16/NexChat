@@ -45,20 +45,18 @@ client/                         server/
 - Pinned messages, room descriptions, member management
 - Live member list with online status
 
-### MongoDB Change Streams
-MongoDB change streams feed directly into Socket.io room broadcasts. No polling.
+### Real-Time Broadcasting
+Messages are persisted to MongoDB and immediately broadcast to connected clients in the corresponding Socket.io room without polling.
 
 ```
 Client send → Socket.io → Server → MongoDB insert
-                                         ↓
-                             Change Stream triggers
                                          ↓
                          io.to(room).emit('message:new')
                                          ↓
                               All room clients receive
 ```
 
-Requires MongoDB replica set (even single-node `rs0`) for change streams.
+*(Note: A MongoDB replica set is still recommended for transactions and future change stream implementations.)*
 
 ### End-to-End Encryption (E2EE)
 

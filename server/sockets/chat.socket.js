@@ -254,6 +254,8 @@ export function registerChatSocket(io) {
       // Cancel any pending typing timers for this user across all rooms
       for (const [key] of typingTimers) {
         if (key.endsWith(`:${user._id}`)) {
+          const roomId = key.split(':')[0];
+          emitTypingUpdate(socket, roomId, false);
           clearTypingTimer(key);
         }
       }

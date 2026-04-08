@@ -47,10 +47,12 @@ export async function assertMembership(roomId, userId) {
   const room = await Room.findById(roomId).lean();
   if (!room) throw new NotFoundError('Room');
 
-  const isMember = room.members.some(
-    (m) => m.toString() === userId.toString()
-  );
-  if (!isMember) throw new ForbiddenError('You are not a member of this room.');
+  if (room.type !== 'public') {
+    const isMember = room.members.some(
+      (m) => m.toString() === userId.toString()
+    );
+    if (!isMember) throw new ForbiddenError('You are not a member of this room.');
+  }
 
   return room;
 }
