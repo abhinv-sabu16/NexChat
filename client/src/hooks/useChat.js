@@ -77,14 +77,14 @@ export function useChat(roomId) {
 
   // ── Decrypt a raw message from the server ─────────────────────────────────
 
-  const decryptIncomingMessage = useCallback(async (msg) => {
+  const decryptIncomingMessage = useCallback(async (msg, availableMembers = members) => {
     try {
       const isOwn = msg.sender.id === user?.id;
       let peerId, peerPubKey;
 
       if (isOwn) {
         // If we sent it, we must derive using the same key we used to encrypt it (the recipient's)
-        const recipient = members.find((m) => m.id !== user.id) ?? members[0];
+        const recipient = availableMembers.find((m) => m.id !== user.id) ?? availableMembers[0];
         if (!recipient) throw new Error('No recipient found');
         peerId = recipient.id;
         peerPubKey = recipient.publicKey;
@@ -122,8 +122,8 @@ export function useChat(roomId) {
       r.members.forEach((m) => { presenceMap[m.id] = m.presence; });
       setPresence(presenceMap);
 
-      // Decrypt all history messages
-      const decrypted = await Promise.all(r.messages.map(decryptIncomingMessage));
+      // Decrypt all history messages using the newly fetched members
+      const decrypted = await Promise.all(r.messages.map(msg => decryptIncomingMessage(msg, r.members)));
       setMessages(decrypted);
       setHasMore(r.messages.length === 20);
 
