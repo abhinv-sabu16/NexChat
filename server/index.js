@@ -46,7 +46,7 @@ const ALLOWED_ORIGINS = new Set([
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || ALLOWED_ORIGINS.has(origin)) {
+    if (!origin || ALLOWED_ORIGINS.has(origin) || origin.endsWith('.vercel.app')) {
       callback(null, true);
     } else {
       callback(new Error(`CORS: origin ${origin} not allowed`));
@@ -77,7 +77,7 @@ const httpServer = http.createServer(app);
 const io = new SocketIOServer(httpServer, {
   cors: {
     origin: (origin, callback) => {
-      if (!origin || ALLOWED_ORIGINS.has(origin)) callback(null, true);
+      if (!origin || ALLOWED_ORIGINS.has(origin) || origin.endsWith('.vercel.app')) callback(null, true);
       else callback(new Error(`CORS: origin ${origin} not allowed`));
     },
     credentials: true,
