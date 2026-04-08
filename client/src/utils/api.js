@@ -257,7 +257,7 @@ export const QUERIES = {
 
 export const MUTATIONS = {
   CREATE_ROOM: /* GraphQL */ `
-    mutation CreateRoom($name: String!, $description: String, $type: RoomType) {
+    mutation CreateRoom($name: String!, $description: String, $type: RoomType!) {
       createRoom(name: $name, description: $description, type: $type) {
         id name description type createdAt
         members { id username publicKey presence }

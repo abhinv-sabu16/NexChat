@@ -1,13 +1,7 @@
 /**
  * sockets/chat.socket.js
  *
- * FIXED VERSION - Resolves message visibility issues
- * 
- * Key fixes:
- * 1. Sender now sees their own messages via socket broadcast
- * 2. Better error handling and logging
- * 3. Emit to entire room INCLUDING sender
- * 4. Add readBy field to socket emissions
+ * All real-time features. Pure event orchestration — no DB or model imports.
  */
 
 import { socketAuthMiddleware }          from '../middleware/auth.js';
@@ -80,15 +74,12 @@ export function registerChatSocket(io) {
 
         // Join the Socket.io room
         socket.join(roomId);
-        
-        console.log(`[socket] User ${user.username} joined room ${roomId}`);
 
         // Mark all existing messages as read
         await markRoomAsRead(roomId, user._id);
 
         ack?.({ ok: true });
       } catch (err) {
-        console.error('[socket] join:room error:', err);
         ack?.(serializeError(err));
       }
     });
@@ -105,19 +96,12 @@ export function registerChatSocket(io) {
       }
 
       socket.leave(roomId);
-      console.log(`[socket] User ${user.username} left room ${roomId}`);
     });
 
     // ── message:send ────────────────────────────────────────────────────────
-    /**
-     * FIXED: Now broadcasts to entire room INCLUDING sender
-     * This ensures the sender sees their message immediately
-     */
     socket.on('message:send', async (payload, ack) => {
       try {
         const { roomId, content, fileId } = validate(SendMessageSchema, payload ?? {});
-
-        console.log(`[socket] message:send from ${user.username} to room ${roomId}`);
 
         // Create message with full population
         const message = await createMessage({
@@ -149,11 +133,9 @@ export function registerChatSocket(io) {
           createdAt: message.createdAt.toISOString(),
         };
 
-        // CRITICAL FIX: Broadcast to ENTIRE room including sender
+        // Broadcast to ENTIRE room including sender
         // This ensures sender sees their own message
         io.in(roomId).emit('message:new', messageEvent);
-
-        console.log(`[socket] message:new emitted to room ${roomId}, messageId: ${message._id}`);
 
         // Acknowledge to sender
         ack?.({ 
@@ -163,7 +145,6 @@ export function registerChatSocket(io) {
         });
 
       } catch (err) {
-        console.error('[socket] message:send error:', err);
         ack?.(serializeError(err));
       }
     });
@@ -210,8 +191,6 @@ export function registerChatSocket(io) {
           roomId: roomId.toString(),
           timestamp: new Date().toISOString(),
         });
-        
-        console.log(`[socket] User ${user.username} marked room ${roomId} as read`);
       } catch (err) {
         console.error('[socket] read:mark error:', err.message);
       }

@@ -1,13 +1,7 @@
 /**
  * services/messageService.js
  *
- * FIXED VERSION - Resolves issues with message visibility in private rooms
- * 
- * Key fixes:
- * 1. Ensure sender always sees their own messages immediately
- * 2. Properly populate all fields including sender details
- * 3. Add debug logging for troubleshooting
- * 4. Handle edge cases in message creation
+ * Single source of truth for all message database operations.
  */
 
 import Message from '../models/Message.js';
@@ -27,8 +21,6 @@ const MESSAGE_POPULATE = [
 
 /**
  * Validates, persists, and returns a new message.
- * 
- * FIXED: Now ensures proper population and returns complete message object
  *
  * @param {object} params
  * @param {string}      params.content   - AES-256-GCM ciphertext ("iv:ct" base64)
@@ -66,19 +58,8 @@ export async function createMessage({ content, senderId, roomId, fileId = null }
       readBy: [], // Initialize empty readBy array
     });
 
-    // CRITICAL: Populate ALL fields before returning
-    // This ensures socket broadcasts have complete data
-    const populatedMessage = await Message.findById(message._id)
-      .populate(MESSAGE_POPULATE)
-      .lean();
-
-    if (!populatedMessage) {
-      throw new Error('Failed to retrieve created message');
-    }
-
-    console.log(`[messageService] Message created: ${populatedMessage._id} in room ${roomId} by ${senderId}`);
-    
-    return populatedMessage;
+    // Populate all fields before returning
+    return message.populate(MESSAGE_POPULATE);
   } catch (err) {
     console.error('[messageService] createMessage error:', err);
     throw err;
@@ -89,8 +70,6 @@ export async function createMessage({ content, senderId, roomId, fileId = null }
 
 /**
  * Retrieves cursor-paginated message history for a room.
- * 
- * FIXED: Better error handling and consistent sorting
  *
  * @param {object} params
  * @param {string}      params.roomId  - Target room's ObjectId
@@ -124,8 +103,6 @@ export async function getMessages({ roomId, limit = 50, before = null }) {
       .limit(safeLimit)
       .populate(MESSAGE_POPULATE)
       .lean();
-
-    console.log(`[messageService] Retrieved ${messages.length} messages for room ${roomId}`);
 
     // Return oldest → newest for correct chat UI rendering
     return messages.reverse();
@@ -161,8 +138,6 @@ export async function getMessageById(messageId) {
 
 /**
  * Marks all unread messages in a room as read by a user.
- * 
- * FIXED: Better error handling and logging
  *
  * @param {string} roomId
  * @param {string} userId
@@ -183,8 +158,6 @@ export async function markRoomAsRead(roomId, userId) {
       { $addToSet: { readBy: userId } }
     );
 
-    console.log(`[messageService] Marked ${result.modifiedCount} messages as read in room ${roomId} for user ${userId}`);
-    
     return result.modifiedCount;
   } catch (err) {
     console.error('[messageService] markRoomAsRead error:', err);
@@ -238,8 +211,6 @@ export async function deleteMessage(messageId, userId) {
   }
 
   await Message.findByIdAndDelete(messageId);
-  
-  console.log(`[messageService] Message ${messageId} deleted by user ${userId}`);
   
   return { success: true };
 }
